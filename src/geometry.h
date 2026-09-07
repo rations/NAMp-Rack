@@ -958,21 +958,57 @@ constexpr ButtonSpec kBackButton = {16, 12, 110, 28, "Amp", Page::Head};
 // Everything below the back button on a non-head page starts here.
 constexpr int kPageContentTop = kBackButton.y + kBackButton.h + 10; // 50
 
-// --- Cabinet page -----------------------------------------------------------
-// The cabinet page does NOT wear the amp head's faceplate: it is a picture of a
+// --- Cabinet column ---------------------------------------------------------
+// The cabinet does NOT wear the amp head's faceplate: it is a picture of a
 // different object, so it is drawn on the same dark ground the head's letterbox
-// uses — and on a window of its own shape, so the cabinet is the page rather
-// than a stamp in the middle of one.
+// uses.
 //
-// The cabinet is drawn as wide as the page allows, and the two loader rows are
+// The cabinet is drawn as wide as the column allows, and the two loader rows are
 // then sized so the pair spans EXACTLY the cabinet's width. That is what stops
-// the page reading as a picture with two unrelated widgets under it: cabinet and
-// rows are one column, and the margin around them is even on all four sides.
+// it reading as a picture with two unrelated widgets under it: cabinet and rows
+// are one block, and the margin around them is even on all four sides.
 constexpr int kCabMargin = 22;
-constexpr int kCabW = kCabPageW - 2 * kCabMargin;      // 596
-constexpr int kCabH = (kCabW * 872 + 1483 / 2) / 1483; // 350, the art's own aspect
+constexpr int kCabW = kCabPageW - 2 * kCabMargin;      // 449
+constexpr int kCabH = (kCabW * 872 + 1483 / 2) / 1483; // 264, the art's own aspect
 constexpr int kCabX = kCabMargin;
-constexpr int kCabY = kPageContentTop;
+
+// The height of one file-loader row. Declared here rather than beside the two IR
+// rows it describes because the block's total height is needed to place the
+// block, and a row is part of that height.
+constexpr int kFileRowH = 28;
+// Between the cabinet art and the loader rows under it.
+constexpr int kCabRowGap = 12;
+// Cabinet plus gap plus one row of loaders: the whole column, as one object.
+constexpr int kCabBlockH = kCabH + kCabRowGap + kFileRowH;
+
+// --- Where that block sits vertically ---------------------------------------
+// CENTRED IN THE WINDOW THE PAGE OPENS AT, not pinned under the back button.
+//
+// It used to be pinned, and that was right when the cabinet was a page of its
+// own: the window was 460 units tall, the block filled it, and there was nothing
+// to centre in. As one column of a page that opens at kSettingsDefaultViewH and
+// scrolls past it, pinning leaves the cabinet hard against the top of a window
+// two hundred units taller than it, with all the air below — which reads as a
+// picture that failed to load the rest of itself.
+//
+// The band is from kPageContentTop (under the back button, which is chrome and
+// does not scroll) to the height the window OPENS at. Not to the page's full 928:
+// the settings column next to it is a scrolling list whose length is its own
+// business, and centring the cabinet against that would put it below the fold on
+// a page it is the left half of.
+//
+// The consequence is that the cabinet is centred exactly at the opening size and
+// drifts from centre as the window is dragged taller or shorter, which is the
+// correct trade: the opening size is the one a user sees every time, and a page
+// that re-centred as it was dragged would move its own contents under the
+// pointer.
+constexpr int kCabY = kPageContentTop + (kSettingsDefaultViewH - kPageContentTop - kCabBlockH) / 2;
+static_assert(kCabY >= kPageContentTop,
+              "the cabinet block is taller than the window the setup page opens at, so centring "
+              "it would push it up under the back button");
+static_assert(kCabY + kCabBlockH <= kSettingsDefaultViewH,
+              "the cabinet block must be whole in the window the setup page opens at — it is the "
+              "half of that page that does not scroll to reveal more");
 
 // The Blend dial is drawn OVER the knob painted into the cabinet art, at the
 // same place and a shade larger so it covers it rather than sitting beside it.
@@ -1000,10 +1036,9 @@ struct FileRow {
     const char *placeholder;
     const char *ext; // browser filter (no dot); empty = directories only
 };
-constexpr int kFileRowH = 28;
-constexpr int kIrRowY = kCabY + kCabH + 12; // 412
+constexpr int kIrRowY = kCabY + kCabH + kCabRowGap; // 411
 constexpr int kIrRowGap = 18;
-constexpr int kIrRowW = (kCabW - kIrRowGap) / 2; // 289
+constexpr int kIrRowW = (kCabW - kIrRowGap) / 2; // 215
 constexpr FileRow kIrRowA = {kCabX, kIrRowY, kIrRowW, kFileRowH, "Select IR...", "wav"};
 constexpr FileRow kIrRowB = {kCabX + kIrRowW + kIrRowGap, kIrRowY, kIrRowW, kFileRowH,
                              "Select IR (optional)...",   "wav"};
@@ -1313,7 +1348,7 @@ constexpr const char *kOutputFootnote =
 // sized to that page rather than to the head's.
 constexpr int kBrowserX = 16;
 constexpr int kBrowserY = 16;
-constexpr int kBrowserW = kCabPageW - 2 * kBrowserX; // 608
+constexpr int kBrowserW = kCabPageW - 2 * kBrowserX; // 461
 constexpr int kBrowserH = kCabPageH - 2 * kBrowserY; // 428
 
 // The settings page opens the same browser for its four capture rows, and it is

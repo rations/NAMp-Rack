@@ -202,6 +202,17 @@ if(NOT WIN32)
     pkg_check_modules(NAMPRACK_JACK REQUIRED IMPORTED_TARGET jack)
 endif()
 
+# The SDK's bundle loader, which is per-platform. Named once here rather than at each consumer:
+# the standalone and the three bundle-driving tools all need it, and picking it in two places is
+# how they end up disagreeing.
+if(WIN32)
+    set(NAMPRACK_MODULE_LOADER_SRC
+        ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/module_win32.cpp)
+else()
+    set(NAMPRACK_MODULE_LOADER_SRC
+        ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/module_linux.cpp)
+endif()
+
 if(NAMPRACK_BUILD_LV2_HOST)
     # LV2 hosting. lilv reads the RDF world, suil instantiates a plug-in's own UI, and the lv2
     # headers are the vocabulary both speak.
@@ -419,6 +430,74 @@ set(NAMPRACK_PLUGIN_SOURCES
     ${NAMPRACK_PLATFORM_VIEW_SOURCES}
 )
 
+# ---------------------------------------------------------------------------
+# Art and fonts, named once.
+#
+# ONE list, three consumers: the validator bundle copies these into Contents/Resources, the embed
+# generator turns the same files into the standalone's built-in fallback set, and panelrender's
+# audit fails if one is missing. Naming them once is what keeps a layer that is drawn from ever
+# being absent from the binary that draws it.
+#
+# The *-base.png files in the same directory are the untrimmed source exports that gui/ trims these
+# out of. They are not listed because they are not shipped.
+# ---------------------------------------------------------------------------
+set(NAMPRACK_FONT_FILES
+    fonts/Michroma-Regular.ttf
+    fonts/Roboto-Regular.ttf
+)
+set(NAMPRACK_IMG_FILES
+    img/head.png
+    img/cabinet.png
+    img/namp-badge.png
+    img/dial.png
+    img/led_on.png
+    img/led_off.png
+    img/switch_up_ring.png
+    img/switch_down_ring.png
+    img/meter_track.png
+    img/Folder.svg
+    img/File.svg
+    img/Cross.svg
+    img/ArrowLeft.svg
+    img/ArrowRight.svg
+    img/SlimmableIcon.svg
+    # Not drawn by the amp's editor. It is the per-node settings icon in the rack strip, which is
+    # a later phase; it ships now because it is a committed asset of this project and leaving it
+    # out would make landing the rack a packaging change as well as a code one.
+    img/Gear.svg
+)
+set(NAMPRACK_RESOURCE_FILES ${NAMPRACK_FONT_FILES} ${NAMPRACK_IMG_FILES})
+
+set(NAMPRACK_FONT_PATHS "")
+foreach(_res IN LISTS NAMPRACK_FONT_FILES)
+    list(APPEND NAMPRACK_FONT_PATHS "${NAMPRACK_ROOT}/resources/${_res}")
+endforeach()
+set(NAMPRACK_IMG_PATHS "")
+foreach(_res IN LISTS NAMPRACK_IMG_FILES)
+    list(APPEND NAMPRACK_IMG_PATHS "${NAMPRACK_ROOT}/resources/${_res}")
+endforeach()
+
+# ---------------------------------------------------------------------------
+# The amp's own code, as a library.
+#
+# It is a library rather than a source list belonging to the bundle because the standalone links it
+# directly. The alternative — having the standalone dlopen an INSTALLED bundle, which is what the
+# amp's own parent standalone did — makes a self-contained product impossible: nothing in ~/.vst3,
+# nothing to run. Linking the same sources into both targets means the standalone is one file and
+# can never load a DIFFERENT, older amp than the one it was just built from.
+#
+# Compiled twice rather than shared as objects on purpose: the bundle and the standalone want
+# different link-time treatment (the bundle re-exports three entry points and hides everything
+# else), and these are a few thousand lines.
+# ---------------------------------------------------------------------------
+add_library(NampRackPlugin STATIC ${NAMPRACK_PLUGIN_SOURCES})
+target_include_directories(NampRackPlugin PUBLIC ${NAMPRACK_ROOT}/src)
+target_link_libraries(NampRackPlugin PUBLIC sdk NampRackGfx ${NAMPRACK_PLATFORM_GUI_LIBS})
+target_compile_features(NampRackPlugin PUBLIC cxx_std_17)
+target_compile_options(NampRackPlugin PRIVATE -ffast-math -Wall)
+set_target_properties(NampRackPlugin PROPERTIES POSITION_INDEPENDENT_CODE ON)
+namprack_link_whole_dsp(NampRackPlugin)
+
 if(NAMPRACK_BUILD_VST3_BUNDLE)
     smtg_add_vst3plugin(NampRackAmp PACKAGE_NAME "NAMp-Rack-Amp"
                         SOURCES_LIST ${NAMPRACK_PLUGIN_SOURCES})
@@ -428,18 +507,57 @@ if(NAMPRACK_BUILD_VST3_BUNDLE)
     target_include_directories(NampRackAmp PRIVATE ${NAMPRACK_ROOT}/src)
     namprack_link_whole_dsp(NampRackAmp)
     target_link_libraries(NampRackAmp PRIVATE sdk NampRackGfx ${NAMPRACK_PLATFORM_GUI_LIBS})
+
+    # The bundle carries its art in Contents/Resources rather than embedded, so it can be replaced
+    # without a rebuild and so respath.cpp resolves it the same way here and in the offline render
+    # rig. The standalone has no bundle to look in and carries the same files inside itself.
+    smtg_target_add_plugin_resources(NampRackAmp
+        RESOURCES ${NAMPRACK_FONT_PATHS}
+        OUTPUT_SUBDIRECTORY fonts
+    )
+    smtg_target_add_plugin_resources(NampRackAmp
+        RESOURCES ${NAMPRACK_IMG_PATHS}
+        OUTPUT_SUBDIRECTORY img
+    )
 endif()
+
+# ---------------------------------------------------------------------------
+# NampRackResources — the art and fonts as byte arrays, for a binary with no resource directory
+# beside it.
+#
+# ONLY THE STANDALONE LINKS THIS. The plug-in must not: it already carries the same files in
+# Contents/Resources, where a user can replace them, and linking both would put two copies of every
+# layer in one bundle. See src/gfx/resourcestore.h for the disk-first lookup order that makes the
+# built-in set a fallback rather than a lock-in.
+#
+# The generated file depends on the resource files themselves, so replacing a layer rebuilds it and
+# nothing else.
+# ---------------------------------------------------------------------------
+set(NAMPRACK_EMBED_CPP "${CMAKE_CURRENT_BINARY_DIR}/generated/namprackembeddedresources.cpp")
+add_custom_command(
+    OUTPUT "${NAMPRACK_EMBED_CPP}"
+    COMMAND ${CMAKE_COMMAND}
+            "-DNAMPRACK_EMBED_ROOT=${NAMPRACK_ROOT}/resources"
+            "-DNAMPRACK_EMBED_FILES=${NAMPRACK_RESOURCE_FILES}"
+            "-DNAMPRACK_EMBED_OUTPUT=${NAMPRACK_EMBED_CPP}"
+            -P "${NAMPRACK_ROOT}/cmake/embedresources.cmake"
+    DEPENDS ${NAMPRACK_FONT_PATHS} ${NAMPRACK_IMG_PATHS}
+            "${NAMPRACK_ROOT}/cmake/embedresources.cmake"
+    COMMENT "Embedding the resource directory into the standalone"
+    VERBATIM
+)
+add_library(NampRackResources STATIC "${NAMPRACK_EMBED_CPP}")
+# NampRackGfx for the include path and for installEmbeddedResources(), which the generated file
+# calls.
+target_link_libraries(NampRackResources PUBLIC NampRackGfx)
+target_compile_features(NampRackResources PRIVATE cxx_std_17)
+set_target_properties(NampRackResources PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
 # Tools: the offline proofs and the panel render.
 # ---------------------------------------------------------------------------
 if(NAMPRACK_BUILD_TOOLS)
-    set(NAMPRACK_MODULE_LOADER
-        ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/module_linux.cpp)
-    if(WIN32)
-        set(NAMPRACK_MODULE_LOADER
-            ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/module_win32.cpp)
-    endif()
+    set(NAMPRACK_MODULE_LOADER ${NAMPRACK_MODULE_LOADER_SRC})
 
     # The three tools that drive the BUILT BUNDLE through the SDK's own hosting classes, rather
     # than linking the DSP directly. That is the point of them: they answer questions about the
@@ -556,6 +674,62 @@ if(NAMPRACK_BUILD_TOOLS)
 endif()
 
 # ---------------------------------------------------------------------------
+# namp-rack — the product. The amp without a DAW: one X window, its own editor embedded in it, a
+# Linux::IRunLoop the editor registers with, and an audio backend driving the processor.
+#
+# ONE FILE, NO INSTALLATION. The amp is linked in (NampRackPlugin) and its art and fonts are linked
+# in (NampRackResources), so this runs on a machine with nothing installed and can never silently
+# run an older installed build than the one just made. A bundle path can still be given on the
+# command line to drive an external build deliberately.
+#
+# NOT BUILT WITHOUT JACK, and that is a hard dependency rather than a degradation: the standalone
+# with no audio is the editor and nothing else, which is what panelrender already covers offline
+# and covers better.
+# ---------------------------------------------------------------------------
+if(NOT WIN32)
+    # usediids.cpp stays HERE and nowhere else: it defines the SDK's interface IIDs and must appear
+    # exactly once in a final binary. The plug-in-side classes come in through NampRackPlugin,
+    # which does not carry them.
+    add_executable(namp-rack
+        ${NAMPRACK_ROOT}/standalone/main.cpp
+        ${NAMPRACK_ROOT}/standalone/audiobackend.h
+        ${NAMPRACK_ROOT}/standalone/runloop.h
+        ${NAMPRACK_ROOT}/standalone/runloop.cpp
+        ${NAMPRACK_ROOT}/standalone/midiroute.h
+        ${NAMPRACK_ROOT}/standalone/midiroute.cpp
+        ${NAMPRACK_ROOT}/standalone/jackclient.h
+        ${NAMPRACK_ROOT}/standalone/jackclient.cpp
+        ${VST3_SDK_DIR}/public.sdk/source/common/memorystream.cpp
+        ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/plugprovider.cpp
+        ${NAMPRACK_MODULE_LOADER_SRC}
+        ${VST3_SDK_DIR}/public.sdk/samples/vst-hosting/editorhost/source/usediids.cpp
+    )
+    target_include_directories(namp-rack
+        PRIVATE ${NAMPRACK_ROOT}/src ${NAMPRACK_ROOT}/standalone)
+    target_link_libraries(namp-rack
+        PRIVATE
+            NampRackPlugin
+            NampRackResources
+            sdk_hosting
+            PkgConfig::NAMPRACK_JACK
+            ${NAMPRACK_PLATFORM_GUI_LIBS}
+    )
+    target_compile_features(namp-rack PRIVATE cxx_std_17)
+    target_compile_options(namp-rack PRIVATE -Wall)
+
+    # Same reasoning as the bundle's --exclude-libs, one layer up. This binary contains the NAM DSP
+    # core and the SDK's plug-in-side classes, and it will dlopen OTHER people's plug-ins —
+    # including other NAM-based ones. Anything it exported would interpose on theirs, and two
+    # copies of a Steinberg symbol in one process is a crash nobody can debug. It exports nothing,
+    # so bind every static archive's symbols locally and keep the dynamic table empty.
+    #
+    # --whole-archive still applies where it is asked for: it decides which OBJECTS are pulled in,
+    # and the DSP core's self-registering architectures are registered from .init_array, which
+    # needs no exported symbol.
+    target_link_options(namp-rack PRIVATE -Wl,--exclude-libs,ALL)
+endif()
+
+# ---------------------------------------------------------------------------
 # Configuration summary
 # ---------------------------------------------------------------------------
 message(STATUS "")
@@ -573,5 +747,5 @@ endif()
 message(STATUS "[NAMp-Rack]   validator bundle ${NAMPRACK_BUILD_VST3_BUNDLE} (never packaged)")
 message(STATUS "[NAMp-Rack]   tools           ${NAMPRACK_BUILD_TOOLS}")
 message(STATUS "[NAMp-Rack]   bundled pedals  ${NAMPRACK_BUILD_PEDALS}")
-message(STATUS "[NAMp-Rack] amp + tools; the host layer and the standalone are not built yet.")
+message(STATUS "[NAMp-Rack] amp + standalone + tools; the host layer is not built yet.")
 message(STATUS "")

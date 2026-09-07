@@ -79,3 +79,13 @@ compile_commands.json
 # OS
 .DS_Store
 Thumbs.db
+
+# tools/local/ — rigs that drive the RUNNING product rather than its sources: the XTest window
+# driver, the channel stomper, the state seeder and the geometry probe. See tools/local/README.md
+# for what each one measures.
+#
+# Untracked as a category, not for being unfinished. Each needs something a phase gate may never
+# depend on — a live X server, libXtst, a running JACK server, a built bundle, a directory of
+# captures — and a gate that needs a window server is a gate that cannot run. The tracked gate on
+# the same code is tools/panelrender.cpp, which renders every page offline and audits the art.
+tools/local/
