@@ -1,0 +1,81 @@
+# Local-only agent guidance (not published; comments in tracked files must not
+# reference these)
+CLAUDE.md
+RULES.md
+task.md
+PLAN.md
+.claude/
+
+# A local set of captures for the offline proofs to run against. These are NOT
+# this project's to publish: a capture is a recording made by whoever trained
+# it, under their own terms, and the code's MIT grant does not reach it. The
+# host ships none and resolves no bank by a tracked path — the four banks are
+# whatever the user loaded — so nothing here depends on this directory existing.
+# The proofs find it through --captures or the test-captures environment
+# variable.
+#
+# Keep it that way: a capture committed here is a capture republished to
+# everyone who clones, and deleting it later does not take it back out of the
+# history.
+captures/
+
+# Rack presets and scan caches written while testing. Derived state that names
+# absolute paths on whichever machine produced it.
+*.rack
+scancache
+pluginindex
+
+# Personal CMake configure presets (local reference-tree paths).
+CMakeUserPresets.json
+
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+# ...but cmake/ holds SOURCE scripts, not generated ones — the MinGW toolchain
+# file and the resource-embed script both live there, and both are named on a
+# command line rather than being generated. Without this negation the blanket
+# *.cmake above keeps them out of a fresh clone, and the Windows build and the
+# self-contained standalone are each unreproducible. Both parent projects had to
+# fix exactly this. Generated .cmake files all live under the build directories
+# already ignored above.
+!cmake/*.cmake
+
+# Compiled output
+*.o
+*.a
+*.so
+*.so.*
+*.vst3
+
+# Release archives produced by scripts/makedist-linux.sh — these are attached
+# to GitHub releases, not committed.
+dist/
+*.tar.gz
+*.tar.xz
+*.zip
+
+# Debug info
+*.pdb
+*.dSYM/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.clangd/
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
