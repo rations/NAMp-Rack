@@ -20,7 +20,8 @@
 #include "audiobackend.h"
 #include "jackclient.h"
 #include "midiroute.h"
-#include "runloop.h"
+#include "editorframe.h"
+#include "eventloop.h"
 
 #include "gfx/resourcestore.h"
 #include "rationsids.h"
@@ -74,12 +75,12 @@ constexpr uint32 kUiTickMs = 33;
 constexpr int kFallbackW = 1133;
 constexpr int kFallbackH = 403;
 
-Rations::RunLoop *gRunLoop = nullptr;
+Rations::EventLoop *gEventLoop = nullptr;
 
 void onSignal(int)
 {
-    if (gRunLoop)
-        gRunLoop->stop();
+    if (gEventLoop)
+        gEventLoop->stop();
 }
 
 //------------------------------------------------------------------------
@@ -633,13 +634,16 @@ int main(int argc, char **argv)
     XMapWindow(display, window);
     XFlush(display);
 
-    Rations::RunLoop runLoop(display);
-    gRunLoop = &runLoop;
+    // One loop for the process, one frame for this view. They are separate objects because the
+    // two interfaces have different multiplicities — see eventloop.h.
+    Rations::EventLoop eventLoop(display);
+    Rations::EditorFrame frame(eventLoop);
+    gEventLoop = &eventLoop;
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
     if (view) {
-        view->setFrame(&runLoop);
+        view->setFrame(&frame);
         if (view->attached(reinterpret_cast<void *>(static_cast<uintptr_t>(window)),
                            kPlatformTypeX11EmbedWindowID) != kResultTrue) {
             fprintf(stderr, "namp-rack: the editor refused to attach\n");
@@ -649,28 +653,40 @@ int main(int argc, char **argv)
     // Only now: the run loop cannot resize a window the view has not attached to, and every page
     // change arrives as exactly that request. This is also where the window takes its one width.
     if (view)
-        runLoop.setEmbedding(window, view);
+        frame.setEmbedding(window, view);
 
     FeedbackPump feedback(audio, controller);
-    runLoop.registerTimer(&feedback, kUiTickMs);
+    eventLoop.registerTimer(&feedback, kUiTickMs);
 
     BufferSizeWatcher blockWatcher(audio, component, processor, setup);
     if (audio.isOpen())
-        runLoop.registerTimer(&blockWatcher, kUiTickMs);
+        eventLoop.registerTimer(&blockWatcher, kUiTickMs);
 
-    runLoop.setXEventCallback([&](const XEvent &event) {
+    // Registered against THIS window rather than as a single global callback: the loop dispatches
+    // by XEvent::xany.window, so a second top-level cannot end up in the same handler.
+    //
+    // THE ConfigureNotify CHECK IS STILL NEEDED, and dropping it as redundant is a bug that
+    // presents as an infinite resize loop. Dispatch matches xany.window, which for a
+    // ConfigureNotify is the xconfigure.EVENT field — "window on which event was requested in event
+    // mask" (X11/Xlib.h) — and this window selected SubstructureNotifyMask, so it is also told when
+    // its CHILDREN resize. On those the event field is this window and matches, while
+    // xconfigure.window is the child and xconfigure.width/height are the CHILD's new size. Feeding
+    // that back as the top-level's size makes the editor resize its child to fit a size that was
+    // its child's, and the two then oscillate for as long as the program runs. Measured: 800x285
+    // and 748x266 alternating forever.
+    eventLoop.addWindow(window, [&](const XEvent &event) {
         if (event.type == ClientMessage && static_cast<Atom>(event.xclient.data.l[0]) == wmDelete)
-            runLoop.stop();
+            eventLoop.stop();
         else if (event.type == ConfigureNotify && event.xconfigure.window == window)
-            runLoop.windowConfigured(event.xconfigure.width, event.xconfigure.height);
+            frame.windowConfigured(event.xconfigure.width, event.xconfigure.height);
     });
 
-    runLoop.run();
+    eventLoop.run();
 
     // --- teardown ----------------------------------------------------
     if (audio.isOpen())
-        runLoop.unregisterTimer(&blockWatcher);
-    runLoop.unregisterTimer(&feedback);
+        eventLoop.unregisterTimer(&blockWatcher);
+    eventLoop.unregisterTimer(&feedback);
     if (view) {
         view->removed();
         view = nullptr;
@@ -693,9 +709,12 @@ int main(int argc, char **argv)
         saveState(component);
     controller->setComponentHandler(nullptr);
 
+    // The window stops being dispatched to BEFORE it is destroyed, so nothing can be handed an
+    // event for a window id that no longer names anything.
+    eventLoop.removeWindow(window);
     XDestroyWindow(display, window);
     XCloseDisplay(display);
-    gRunLoop = nullptr;
+    gEventLoop = nullptr;
     // The provider owns the component and the controller, and both must be gone before the module
     // that produced them is unloaded. Released here rather than left to scope exit, because
     // `module` is declared above it and would otherwise be destroyed first.

@@ -1,16 +1,12 @@
-// RunLoop implementation. See runloop.h.
+// EditorFrame implementation. See editorframe.h.
 
-#include "runloop.h"
+#include "editorframe.h"
 
 #include <X11/Xutil.h>
-#include <sys/select.h>
 
-#include <algorithm>
-#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 
 using namespace Steinberg;
 
@@ -18,13 +14,13 @@ namespace Rations
 {
 
 //------------------------------------------------------------------------
-RunLoop::RunLoop(::Display *display) : mDisplay(display)
+EditorFrame::EditorFrame(EventLoop &loop) : mLoop(loop)
 {
     mTrace = std::getenv("NAMPRACK_STANDALONE_TRACE") != nullptr;
 }
 
 //------------------------------------------------------------------------
-void RunLoop::trace(const char *fmt, ...) const
+void EditorFrame::trace(const char *fmt, ...) const
 {
     if (!mTrace)
         return;
@@ -37,16 +33,17 @@ void RunLoop::trace(const char *fmt, ...) const
 }
 
 //------------------------------------------------------------------------
-tresult PLUGIN_API RunLoop::queryInterface(const TUID iid, void **obj)
+// The one place the two scopes meet. A plug-in holds a frame pointer and asks IT for the run loop,
+// so the frame answers for an object it does not own — which is exactly right: there is one loop
+// per process and this hands out a borrowed pointer to it.
+tresult PLUGIN_API EditorFrame::queryInterface(const TUID iid, void **obj)
 {
     if (!obj)
         return kInvalidArgument;
 
-    if (FUnknownPrivate::iidEqual(iid, Linux::IRunLoop::iid)) {
-        *obj = static_cast<Linux::IRunLoop *>(this);
-        addRef();
-        return kResultOk;
-    }
+    if (FUnknownPrivate::iidEqual(iid, Linux::IRunLoop::iid))
+        return mLoop.queryInterface(iid, obj);
+
     if (FUnknownPrivate::iidEqual(iid, IPlugFrame::iid) ||
         FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
         *obj = static_cast<IPlugFrame *>(this);
@@ -59,7 +56,7 @@ tresult PLUGIN_API RunLoop::queryInterface(const TUID iid, void **obj)
 }
 
 //------------------------------------------------------------------------
-void RunLoop::setEmbedding(::Window window, IPlugView *view)
+void EditorFrame::setEmbedding(::Window window, IPlugView *view)
 {
     mWindow = window;
     mView = view;
@@ -77,22 +74,24 @@ void RunLoop::setEmbedding(::Window window, IPlugView *view)
 }
 
 //------------------------------------------------------------------------
-void RunLoop::applySize(int w, int h)
+void EditorFrame::applySize(int w, int h)
 {
-    if (!mDisplay || !mWindow || w <= 0 || h <= 0)
+    ::Display *display = mLoop.display();
+    if (!display || !mWindow || w <= 0 || h <= 0)
         return;
     // Recorded BEFORE the request, because the ConfigureNotify it provokes may be dispatched
     // before we return here and must already be recognisable as ours.
     mAppliedW = w;
     mAppliedH = h;
-    XResizeWindow(mDisplay, mWindow, static_cast<unsigned>(w), static_cast<unsigned>(h));
-    XFlush(mDisplay);
+    XResizeWindow(display, mWindow, static_cast<unsigned>(w), static_cast<unsigned>(h));
+    XFlush(display);
 }
 
 //------------------------------------------------------------------------
-void RunLoop::updateSizeHints()
+void EditorFrame::updateSizeHints()
 {
-    if (!mDisplay || !mWindow || !mView)
+    ::Display *display = mLoop.display();
+    if (!display || !mWindow || !mView)
         return;
 
     // Ask the view rather than deciding here: this file knows nothing about pages, and does not
@@ -127,7 +126,7 @@ void RunLoop::updateSizeHints()
         hints.min_width = hints.max_width = mAppliedW;
         hints.min_height = hints.max_height = mAppliedH;
     }
-    XSetWMNormalHints(mDisplay, mWindow, &hints);
+    XSetWMNormalHints(display, mWindow, &hints);
     trace("hints: %d..%d wide, %d..%d tall", hints.min_width, hints.max_width, hints.min_height,
           hints.max_height);
 }
@@ -136,7 +135,7 @@ void RunLoop::updateSizeHints()
 // The plug-in asking for a different window, which here means a page change: the two pages are two
 // canvases and the editor calls this on both of them.
 //
-// HEIGHT IS GRANTED, WIDTH IS PINNED. See the policy at the top of runloop.h — the top-level
+// HEIGHT IS GRANTED, WIDTH IS PINNED. See the policy at the top of editorframe.h — the top-level
 // window is shared with a strip below the editor, so its width is set once and a page change moves
 // only the bottom edge. The view is then told the size it really got, not the size it asked for,
 // which is what a host does with any request it cannot grant exactly.
@@ -150,7 +149,7 @@ void RunLoop::updateSizeHints()
 // The SDK's sequence (pluginterfaces/gui/iplugview.h): the plug-in calls resizeView, the host
 // resizes the window, and the host calls back into onSize IN THE SAME CALLSTACK. Doing it in that
 // order matters — the editor's onSize re-enters its own constrainSize before this returns.
-tresult PLUGIN_API RunLoop::resizeView(IPlugView *view, ViewRect *newSize)
+tresult PLUGIN_API EditorFrame::resizeView(IPlugView *view, ViewRect *newSize)
 {
     if (!view || !newSize)
         return kInvalidArgument;
@@ -213,7 +212,7 @@ tresult PLUGIN_API RunLoop::resizeView(IPlugView *view, ViewRect *newSize)
 // changes it, and whatever they drag it to becomes the new locked width. The distinction is between
 // the user asking for a width and the EDITOR asking for one — the first is granted, the second is
 // what would move the strip below.
-void RunLoop::windowConfigured(int w, int h)
+void EditorFrame::windowConfigured(int w, int h)
 {
     if (!mView || w <= 0 || h <= 0)
         return;
@@ -229,160 +228,6 @@ void RunLoop::windowConfigured(int w, int h)
 
     ViewRect actual(0, 0, w, h);
     mView->onSize(&actual);
-}
-
-//------------------------------------------------------------------------
-tresult PLUGIN_API RunLoop::registerEventHandler(Linux::IEventHandler *handler,
-                                                 Linux::FileDescriptor fd)
-{
-    if (!handler || fd < 0)
-        return kInvalidArgument;
-    mEventHandlers.push_back({handler, fd});
-    return kResultTrue;
-}
-
-tresult PLUGIN_API RunLoop::unregisterEventHandler(Linux::IEventHandler *handler)
-{
-    if (!handler)
-        return kInvalidArgument;
-    const size_t before = mEventHandlers.size();
-    mEventHandlers.erase(
-        std::remove_if(mEventHandlers.begin(), mEventHandlers.end(),
-                       [handler](const EventEntry &e) { return e.handler == handler; }),
-        mEventHandlers.end());
-    return mEventHandlers.size() != before ? kResultTrue : kResultFalse;
-}
-
-//------------------------------------------------------------------------
-tresult PLUGIN_API RunLoop::registerTimer(Linux::ITimerHandler *handler, Linux::TimerInterval ms)
-{
-    if (!handler || ms == 0)
-        return kInvalidArgument;
-    const std::chrono::milliseconds interval(ms);
-    mTimers.push_back({handler, interval, Clock::now() + interval});
-    return kResultTrue;
-}
-
-tresult PLUGIN_API RunLoop::unregisterTimer(Linux::ITimerHandler *handler)
-{
-    if (!handler)
-        return kInvalidArgument;
-    const size_t before = mTimers.size();
-    mTimers.erase(std::remove_if(mTimers.begin(), mTimers.end(),
-                                 [handler](const TimerEntry &t) { return t.handler == handler; }),
-                  mTimers.end());
-    return mTimers.size() != before ? kResultTrue : kResultFalse;
-}
-
-//------------------------------------------------------------------------
-int RunLoop::fireDueTimersAndGetTimeout()
-{
-    if (mTimers.empty())
-        return -1;
-
-    const Clock::time_point now = Clock::now();
-
-    // Fire from a snapshot: a handler may register or unregister timers, which would otherwise
-    // invalidate the iteration.
-    std::vector<Linux::ITimerHandler *> due;
-    for (TimerEntry &t : mTimers) {
-        if (t.next <= now) {
-            due.push_back(t.handler);
-            // Skip missed firings rather than trying to catch up in a burst.
-            t.next = now + t.interval;
-        }
-    }
-    for (Linux::ITimerHandler *handler : due) {
-        // The handler may have been unregistered by an earlier callback.
-        const bool live =
-            std::any_of(mTimers.begin(), mTimers.end(),
-                        [handler](const TimerEntry &t) { return t.handler == handler; });
-        if (live)
-            handler->onTimer();
-    }
-
-    if (mTimers.empty())
-        return -1;
-
-    Clock::time_point soonest = mTimers.front().next;
-    for (const TimerEntry &t : mTimers)
-        soonest = std::min(soonest, t.next);
-
-    const auto delta =
-        std::chrono::duration_cast<std::chrono::milliseconds>(soonest - Clock::now()).count();
-    return delta < 0 ? 0 : static_cast<int>(delta);
-}
-
-//------------------------------------------------------------------------
-void RunLoop::run()
-{
-    mRunning.store(true, std::memory_order_relaxed);
-    const int xFd = mDisplay ? ConnectionNumber(mDisplay) : -1;
-
-    while (mRunning.load(std::memory_order_relaxed)) {
-        // Anything already queued on our own connection is handled first: select() would not
-        // report the fd as readable for events Xlib has already buffered.
-        if (mDisplay) {
-            while (XPending(mDisplay)) {
-                XEvent event;
-                XNextEvent(mDisplay, &event);
-                if (mXCallback)
-                    mXCallback(event);
-                if (!mRunning.load(std::memory_order_relaxed))
-                    return;
-            }
-            XFlush(mDisplay);
-        }
-
-        const int timeoutMs = fireDueTimersAndGetTimeout();
-        if (!mRunning.load(std::memory_order_relaxed))
-            return;
-
-        fd_set readSet;
-        FD_ZERO(&readSet);
-        int maxFd = -1;
-        if (xFd >= 0) {
-            FD_SET(xFd, &readSet);
-            maxFd = xFd;
-        }
-        const std::vector<EventEntry> handlers = mEventHandlers; // snapshot
-        for (const EventEntry &e : handlers) {
-            FD_SET(e.fd, &readSet);
-            maxFd = std::max(maxFd, e.fd);
-        }
-        if (maxFd < 0)
-            break; // nothing left to wait on
-
-        timeval tv;
-        timeval *tvp = nullptr;
-        if (timeoutMs >= 0) {
-            tv.tv_sec = timeoutMs / 1000;
-            tv.tv_usec = (timeoutMs % 1000) * 1000;
-            tvp = &tv;
-        }
-
-        const int ready = select(maxFd + 1, &readSet, nullptr, nullptr, tvp);
-        if (ready < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-        if (ready == 0)
-            continue; // timeout: loop round and fire the timers
-
-        for (const EventEntry &e : handlers) {
-            if (!FD_ISSET(e.fd, &readSet))
-                continue;
-            // Still registered? A previous callback may have removed it.
-            const bool live =
-                std::any_of(mEventHandlers.begin(), mEventHandlers.end(),
-                            [&e](const EventEntry &c) { return c.handler == e.handler; });
-            if (live)
-                e.handler->onFDIsSet(e.fd);
-            if (!mRunning.load(std::memory_order_relaxed))
-                return;
-        }
-    }
 }
 
 } // namespace Rations

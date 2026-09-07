@@ -1,0 +1,228 @@
+// Vst3Backend — hosting a VST3 plug-in as one node of the chain.
+//
+// The heavy lifting is the SDK's: VST3::Hosting::Module loads the bundle, Vst::PlugProvider builds
+// and connects the component/controller pair, Vst::HostProcessData carries the bus plumbing and
+// Vst::ParameterChangeTransfer is a ready-made lock-free ring for UI-to-RT parameter edits. This
+// class is the glue plus four decisions that are easy to get wrong:
+//
+//   1. NO BUFFER COPIES. HostProcessData::prepare() is called with bufferSamples == 0, which leaves
+//      channelBufferOwner false and lets us aim each channel pointer straight at a chain bus with
+//      setChannelBuffer(). The parent project instead memcpys the block in, memsets every output
+//      channel, calls process(), and memcpys the result back out — three passes per plug-in per
+//      block, multiplying by chain length. None of that happens here.
+//
+//   2. BUSES MUST BE ACTIVATED. VST3 audio buses are inactive by default and most plug-ins emit
+//      silence if the host forgets. Every default-active bus gets activateBus().
+//
+//   3. IN AND OUT ARE NEVER ALIASED. VST3 does not promise a plug-in tolerates identical input and
+//      output pointers, so prefersInPlace() returns false and the chain compiler always gives this
+//      node distinct slots. That costs nothing: the chain ping-pongs between pre-allocated buses,
+//      so distinct slots are still zero copies.
+//
+//   4. PARAMETER EDITS ARE ENQUEUED, NEVER APPLIED DIRECTLY. paramSetFromUi() updates the
+//      controller (a UI-thread object) and pushes into the transfer ring; the audio thread drains
+//      the ring into the input queues at the top of process(). The controller is never touched from
+//      the audio thread and the plug-in's processing state is never touched from the UI thread.
+//
+// Channel adaptation: when the plug-in's negotiated channel count matches the chain's, the fast
+// path applies and nothing is copied. When it does not — a stereo-only plug-in placed in the mono
+// pre-amp section — the node falls back to internal scratch buffers with copies at both ends. That
+// fallback costs exactly what the parent project always pays, so the win is opportunistic; it is
+// documented rather than hidden.
+
+#pragma once
+
+#include "pluginbackend.h"
+
+#include "public.sdk/source/vst/hosting/module.h"
+#include "public.sdk/source/vst/hosting/plugprovider.h"
+#include "public.sdk/source/vst/hosting/processdata.h"
+#include "public.sdk/source/vst/hosting/parameterchanges.h"
+#include "pluginterfaces/vst/ivstaudioprocessor.h"
+#include "pluginterfaces/vst/ivstcomponent.h"
+#include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "pluginterfaces/gui/iplugview.h"
+
+#include <atomic>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace NAMp::host
+{
+
+//------------------------------------------------------------------------
+// Split a VST3 key into its bundle path and class uid. Returns false if the key is malformed —
+// a saved chain is untrusted input.
+bool parseVst3Key(const std::string &key, std::string &bundlePath, std::string &uidString);
+
+// Build a key from the two halves.
+std::string makeVst3Key(const std::string &bundlePath, const std::string &uidString);
+
+//------------------------------------------------------------------------
+class Vst3Backend final : public PluginBackend
+{
+public:
+    ~Vst3Backend() override;
+
+    // Loads the bundle and builds the component/controller pair. Returns null on any failure, with
+    // a reason in `error`. Does no audio configuration — that is prepare().
+    static Vst3Backend *load(const PluginRef &ref, std::string &error);
+
+    //--- identity ------------------------------------------------------
+    PluginFormat format() const override
+    {
+        return PluginFormat::Vst3;
+    }
+    const char *key() const override
+    {
+        return mKey.c_str();
+    }
+    const char *displayName() const override
+    {
+        return mName.c_str();
+    }
+    const char *category() const override
+    {
+        return mCategory.c_str();
+    }
+
+    //--- lifecycle -----------------------------------------------------
+    bool prepare(const ProcessConfig &config) override;
+    void activate() override;
+    void deactivate() override;
+    void reset() override;
+
+    uint32_t latencySamples() const override;
+    // Always false — see decision 3 in the file comment.
+    bool prefersInPlace() const override
+    {
+        return false;
+    }
+    int32_t audioInCount() const override
+    {
+        return mPlugInChannels;
+    }
+    int32_t audioOutCount() const override
+    {
+        return mPlugOutChannels;
+    }
+
+    //--- real time -----------------------------------------------------
+    void process(const AudioBlock &block) noexcept override;
+
+    //--- parameters ----------------------------------------------------
+    uint32_t paramCount() const override
+    {
+        return static_cast<uint32_t>(mParams.size());
+    }
+    bool paramInfo(uint32_t index, ParamInfo &out) const override;
+    double paramGet(uint32_t index) const override;
+    void paramSetFromUi(uint32_t index, double normalized) override;
+    bool paramDisplay(uint32_t index, double normalized, char *buf, int32_t bufLen) const override;
+    bool paramPollFromRt(uint32_t &index, double &normalized) override;
+    void paramFlushToPlugin() override;
+
+    //--- state ---------------------------------------------------------
+    bool stateSave(std::vector<uint8_t> &out) const override;
+    bool stateLoad(const uint8_t *data, size_t len) override;
+
+    //--- editor --------------------------------------------------------
+    EditorKind editorKind() const override;
+    bool editorOpen(const EditorOpenRequest &request, EditorSurface &out) override;
+    void editorIdle() override
+    {
+    }
+    bool editorTakeResizeRequest(int32_t &w, int32_t &h) override;
+    bool editorCheckSize(int32_t &w, int32_t &h) const override;
+    void editorSetSize(int32_t w, int32_t h) override;
+    void editorShow() override
+    {
+    }
+    void editorHide() override
+    {
+    }
+    void editorClose() override;
+
+    //--- host extensions ------------------------------------------------
+    bool hasFileLoader() const override;
+    bool fileGet(int32_t which, char *buf, int32_t bufLen) const override;
+    bool fileSet(int32_t which, const char *path) override;
+
+    //--- diagnostics ----------------------------------------------------
+    int64_t diagTakeMaxMicros() override;
+    uint64_t diagRtAllocCount() const override
+    {
+        return mRtAllocCount.load(std::memory_order_relaxed);
+    }
+
+private:
+    Vst3Backend() = default;
+
+    void teardown();
+    // Turn on every audio bus the plug-in marks default-active. Without this most plug-ins are
+    // silent.
+    void activateDefaultBuses();
+    // Ask for `channels` in and out; record what the plug-in actually accepted.
+    void negotiateArrangements(int32_t channels);
+
+    //--- identity, immutable after load() -------------------------------
+    std::string mKey;
+    std::string mName;
+    std::string mCategory;
+
+    //--- the plug-in ----------------------------------------------------
+    VST3::Hosting::Module::Ptr mModule;
+    Steinberg::IPtr<Steinberg::Vst::PlugProvider> mProvider;
+    Steinberg::IPtr<Steinberg::Vst::IComponent> mComponent;
+    Steinberg::IPtr<Steinberg::Vst::IEditController> mController;
+    Steinberg::IPtr<Steinberg::Vst::IAudioProcessor> mProcessor;
+    Steinberg::IPtr<Steinberg::IPlugView> mView;
+
+    //--- audio configuration --------------------------------------------
+    ProcessConfig mConfig;
+    bool mPrepared = false;
+    bool mActive = false;
+    int32_t mPlugInChannels = 0;
+    int32_t mPlugOutChannels = 0;
+    // True when the plug-in's channel count matches the chain's, so pointers can be aimed straight
+    // at the chain buses and nothing is copied.
+    bool mDirectBuffers = false;
+
+    // Only used on the fallback path (see the file comment). Empty otherwise.
+    std::vector<float> mScratch;
+    std::vector<float *> mScratchIn;
+    std::vector<float *> mScratchOut;
+
+    Steinberg::Vst::HostProcessData mData;
+    Steinberg::Vst::ProcessContext mContext = {};
+    Steinberg::Vst::ParameterChanges mInputChanges;
+    Steinberg::Vst::ParameterChanges mOutputChanges;
+    Steinberg::Vst::ParameterChangeTransfer mToRt;
+    Steinberg::Vst::ParameterChangeTransfer mFromRt;
+
+    //--- parameters -----------------------------------------------------
+    struct Param {
+        Steinberg::Vst::ParamID id = 0;
+        int32_t stepCount = 0;
+        double defaultNormalized = 0.0;
+        bool isBypass = false;
+        bool isReadOnly = false;
+        bool isMidiMapped = false;
+        char title[128] = {};
+        char units[32] = {};
+    };
+    std::vector<Param> mParams;
+
+    //--- editor ---------------------------------------------------------
+    std::atomic<bool> mResizePending{false};
+    std::atomic<int32_t> mResizeW{0};
+    std::atomic<int32_t> mResizeH{0};
+
+    //--- diagnostics ----------------------------------------------------
+    std::atomic<int64_t> mMaxMicros{0};
+    std::atomic<uint64_t> mRtAllocCount{0};
+};
+
+} // namespace NAMp::host

@@ -554,6 +554,122 @@ target_compile_features(NampRackResources PRIVATE cxx_std_17)
 set_target_properties(NampRackResources PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
+# NampRackJalv — jalv's event-buffer helper, vendored under deps/jalv (ISC).
+#
+# It is the one piece of jalv that is a library and is not shipped as one, so it is copied rather
+# than depended on. Compiled as C, never reformatted; deps/jalv/namp_jalv_compat.h records the
+# lines that had to change and why, and NOTICE carries the licence.
+# ---------------------------------------------------------------------------
+if(NAMPRACK_BUILD_LV2_HOST)
+    add_library(NampRackJalv STATIC ${NAMPRACK_ROOT}/deps/jalv/lv2_evbuf.c)
+    target_include_directories(NampRackJalv PUBLIC ${NAMPRACK_ROOT}/deps/jalv)
+    target_link_libraries(NampRackJalv PUBLIC PkgConfig::LV2HOST)
+    set_target_properties(NampRackJalv PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
+endif()
+
+# ---------------------------------------------------------------------------
+# NampRackHost — the format-agnostic plug-in host: backends, scanning and the chain engine.
+# Everything needed to run OTHER people's plug-ins around the amp.
+#
+# LINKS NO X11, NO CAIRO AND NO JACK, deliberately. A hosted editor's parent window travels through
+# this layer as an opaque uintptr_t and its IPlugView as a void*, so nothing here needs Xlib. That
+# is what lets namp_hostcheck link this library and nothing else, which in turn is what keeps the
+# claim honest instead of merely intended.
+#
+# THE LV2 SPLIT IS A BUILD-GRAPH FACT, NOT AN INTERFACE ONE. LV2 hosting is lilv + suil + jalv's
+# event buffer, none of which is part of the Windows build; VST3 hosting, the chain engine, the
+# catalogue and the out-of-process scanner build everywhere. PluginBackend is format-agnostic and
+# needs no change for this — the two guarded call sites are createBackend() in chainbuilder.cpp and
+# the LV2 pass of Catalog::rescan(). PluginFormat::Lv2 itself stays in the enum on every platform,
+# so a rack saved where LV2 IS hosted comes back as a named placeholder that writes itself out
+# again verbatim, rather than as a node silently dropped from the middle of someone's chain.
+#
+# hostiids.cpp is deliberately NOT part of this library — see the note at the top of that file.
+# It is listed by each host EXECUTABLE instead.
+# ---------------------------------------------------------------------------
+set(NAMPRACK_HOST_SOURCES
+    ${NAMPRACK_ROOT}/src/host/format.h
+    ${NAMPRACK_ROOT}/src/host/pluginref.h
+    ${NAMPRACK_ROOT}/src/host/pluginbackend.h
+    ${NAMPRACK_ROOT}/src/host/inampfileloader.h
+    ${NAMPRACK_ROOT}/src/host/rtdenormal.h
+    ${NAMPRACK_ROOT}/src/host/hostapp.h
+    ${NAMPRACK_ROOT}/src/host/hostapp.cpp
+    ${NAMPRACK_ROOT}/src/host/diagnostics.h
+    ${NAMPRACK_ROOT}/src/host/diagnostics.cpp
+    ${NAMPRACK_ROOT}/src/host/spscbytequeue.h
+    ${NAMPRACK_ROOT}/src/host/backend_vst3.h
+    ${NAMPRACK_ROOT}/src/host/backend_vst3.cpp
+    ${NAMPRACK_ROOT}/src/host/chainmodel.h
+    ${NAMPRACK_ROOT}/src/host/chainengine.h
+    ${NAMPRACK_ROOT}/src/host/chainengine.cpp
+    ${NAMPRACK_ROOT}/src/host/chainbuilder.h
+    ${NAMPRACK_ROOT}/src/host/chainbuilder.cpp
+    ${NAMPRACK_ROOT}/src/host/rackpreset.h
+    ${NAMPRACK_ROOT}/src/host/rackpreset.cpp
+    ${NAMPRACK_ROOT}/src/host/scancache.h
+    ${NAMPRACK_ROOT}/src/host/scancache.cpp
+    ${NAMPRACK_ROOT}/src/host/pluginpaths.h
+    ${NAMPRACK_ROOT}/src/host/pluginpaths.cpp
+    ${NAMPRACK_ROOT}/src/host/catalog.h
+    ${NAMPRACK_ROOT}/src/host/catalog.cpp
+    ${NAMPRACK_ROOT}/src/host/scanchild.h
+    ${NAMPRACK_ROOT}/src/host/scanchild.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/parameterchanges.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/processdata.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/hostclasses.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/pluginterfacesupport.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/connectionproxy.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/eventlist.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/utility/stringconvert.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/plugprovider.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/common/memorystream.cpp
+    ${NAMPRACK_MODULE_LOADER_SRC}
+)
+
+if(NAMPRACK_BUILD_LV2_HOST)
+    list(APPEND NAMPRACK_HOST_SOURCES
+        ${NAMPRACK_ROOT}/src/host/lv2urid.h
+        ${NAMPRACK_ROOT}/src/host/lv2urid.cpp
+        ${NAMPRACK_ROOT}/src/host/lv2worker.h
+        ${NAMPRACK_ROOT}/src/host/lv2worker.cpp
+        ${NAMPRACK_ROOT}/src/host/lv2world.h
+        ${NAMPRACK_ROOT}/src/host/lv2world.cpp
+        ${NAMPRACK_ROOT}/src/host/backend_lv2.h
+        ${NAMPRACK_ROOT}/src/host/backend_lv2.cpp
+    )
+endif()
+
+add_library(NampRackHost STATIC ${NAMPRACK_HOST_SOURCES})
+target_include_directories(NampRackHost PUBLIC ${NAMPRACK_ROOT}/src ${NAMPRACK_ROOT}/src/host)
+target_link_libraries(NampRackHost PUBLIC sdk_hosting ${CMAKE_DL_LIBS})
+target_compile_features(NampRackHost PUBLIC cxx_std_17)
+target_compile_options(NampRackHost PRIVATE -Wall)
+set_target_properties(NampRackHost PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# PUBLIC, not PRIVATE: the guarded declarations are in headers this library exports, so a consumer
+# that sees a different value than the library was built with would disagree with it about which
+# functions exist.
+if(NAMPRACK_BUILD_LV2_HOST)
+    target_compile_definitions(NampRackHost PUBLIC NAMPRACK_HAVE_LV2=1)
+    target_link_libraries(NampRackHost PUBLIC NampRackJalv PkgConfig::LV2HOST)
+else()
+    target_compile_definitions(NampRackHost PUBLIC NAMPRACK_HAVE_LV2=0)
+endif()
+
+# NO -ffast-math ON THIS TARGET, and the absence is asserted rather than left to review.
+# clampChainOutput() in chainengine.cpp is built out of an std::isfinite() test, and
+# -ffinite-math-only gives the compiler permission to assume that test's answer and delete it — at
+# which point a hosted plug-in emitting NaN reaches the speakers and nothing in the tree says so.
+get_target_property(_namprack_host_flags NampRackHost COMPILE_OPTIONS)
+if(_namprack_host_flags MATCHES "ffast-math|ffinite-math-only")
+    message(FATAL_ERROR
+        "NampRackHost carries ${_namprack_host_flags}. The end-of-chain NaN clamp in "
+        "chainengine.cpp is an std::isfinite() test, and -ffinite-math-only lets the compiler "
+        "delete it. Whatever added that flag has to exclude this target.")
+endif()
+
+# ---------------------------------------------------------------------------
 # Tools: the offline proofs and the panel render.
 # ---------------------------------------------------------------------------
 if(NAMPRACK_BUILD_TOOLS)
@@ -614,19 +730,6 @@ if(NAMPRACK_BUILD_TOOLS)
         target_compile_options(${_tool} PRIVATE -Wall)
     endforeach()
 
-    # ThreadSanitizer is a Linux gate and always was. MinGW ships no TSan runtime, so asking for
-    # it in a cross build fails at link with an unresolved __tsan_init rather than saying what is
-    # wrong. Refuse it here instead, and say so, rather than letting the option look as though it
-    # did something.
-    option(NAMPRACK_ENABLE_TSAN "Build the race gate under ThreadSanitizer" OFF)
-    if(NAMPRACK_ENABLE_TSAN AND WIN32)
-        message(WARNING
-            "[NAMp-Rack] NAMPRACK_ENABLE_TSAN is ignored for the Windows cross build: MinGW has "
-            "no ThreadSanitizer runtime. Run the race gate natively on Linux.")
-    elseif(NAMPRACK_ENABLE_TSAN)
-        target_compile_options(rations_racecheck PRIVATE -fsanitize=thread -g -O1)
-        target_link_options(rations_racecheck PRIVATE -fsanitize=thread)
-    endif()
 
     # The allocation gate. Deliberately links NO graphics at all — it is measuring allocations on
     # the audio path, and a Cairo dependency would put an allocator on the link line that has no
@@ -671,6 +774,86 @@ if(NAMPRACK_BUILD_TOOLS)
     target_link_libraries(panelrender PRIVATE NampRackGfx)
     target_include_directories(panelrender PRIVATE ${VST3_SDK_DIR})
     target_compile_options(panelrender PRIVATE -Wall)
+
+    # ---------------------------------------------------------------------------
+    # namp_hostcheck — the host phase gate. Links NampRackHost and NOTHING ELSE, which is not a
+    # convenience: it is what keeps that library honest about carrying no X11, no Cairo and no
+    # JACK. A dependency that crept in would fail to link here rather than being discovered in a
+    # DAW.
+    #
+    # It calls runScanChildIfRequested() like every host binary here, so it probes bundles out of
+    # process by re-execing itself. That makes it a gate on the isolation path too, and not only on
+    # the catalogue.
+    # ---------------------------------------------------------------------------
+    add_executable(namp_hostcheck
+        ${NAMPRACK_ROOT}/tools/namp_hostcheck.cpp
+        ${NAMPRACK_ROOT}/src/host/hostiids.cpp
+        ${VST3_SDK_DIR}/public.sdk/samples/vst-hosting/editorhost/source/usediids.cpp
+    )
+    target_link_libraries(namp_hostcheck PRIVATE NampRackHost)
+    target_compile_features(namp_hostcheck PRIVATE cxx_std_17)
+    target_compile_options(namp_hostcheck PRIVATE -Wall)
+
+    # ---------------------------------------------------------------------------
+    # namp_chaincheck — the chain phase gate. --routing checks the compiled routing numerically
+    # against synthetic backends, so it needs no plug-in installed, no window server and no audio
+    # device; --rt counts allocations through a chain of real VST3 plug-ins using the DSP core's
+    # own malloc interception.
+    #
+    # allocation_tracking.cpp is compiled in directly rather than linked: it overrides the global
+    # allocator, which only means anything in a final binary.
+    # ---------------------------------------------------------------------------
+    #
+    # allocation_tracking.cpp is left OUT of the ThreadSanitizer build. Both it and the sanitizer
+    # interpose the process allocator, and the pair segfaults during startup with nothing printed —
+    # measured, not guessed. The tool compiles either way and says which build it is; see the note
+    # at the top of namp_chaincheck.cpp.
+    set(NAMPRACK_CHAINCHECK_SRC
+        ${NAMPRACK_ROOT}/tools/namp_chaincheck.cpp
+        ${NAMPRACK_ROOT}/src/host/hostiids.cpp
+        ${VST3_SDK_DIR}/public.sdk/samples/vst-hosting/editorhost/source/usediids.cpp
+    )
+    if(NOT NAMPRACK_ENABLE_TSAN)
+        list(APPEND NAMPRACK_CHAINCHECK_SRC ${NAM_CORE_DIR}/tools/test/allocation_tracking.cpp)
+    endif()
+    add_executable(namp_chaincheck ${NAMPRACK_CHAINCHECK_SRC})
+    target_link_libraries(namp_chaincheck PRIVATE NampRackHost)
+    target_include_directories(namp_chaincheck PRIVATE ${NAM_CORE_DIR}/tools)
+    target_compile_features(namp_chaincheck PRIVATE cxx_std_17)
+    # -O0 for the same reason rations_rtcheck needs it: C++14 onwards lets the optimiser elide a
+    # new/delete pair outright, which would silently disarm the deliberate allocation this tool
+    # makes to prove its own harness is armed. Only this file is affected — NampRackHost stays
+    # optimised, and the interception is at the malloc symbol, so what is measured is the release
+    # build of the chain.
+    target_compile_options(namp_chaincheck PRIVATE -Wall -O0 -UNDEBUG)
+
+    # ThreadSanitizer is a Linux gate and always was. MinGW ships no TSan runtime, so asking for
+    # it in a cross build fails at link with an unresolved __tsan_init rather than saying what is
+    # wrong. Refuse it here instead, and say so, rather than letting the option look as though it
+    # did something.
+    option(NAMPRACK_ENABLE_TSAN "Build the race gate under ThreadSanitizer" OFF)
+    if(NAMPRACK_ENABLE_TSAN AND WIN32)
+        message(WARNING
+            "[NAMp-Rack] NAMPRACK_ENABLE_TSAN is ignored for the Windows cross build: MinGW has "
+            "no ThreadSanitizer runtime. Run the race gate natively on Linux.")
+    elseif(NAMPRACK_ENABLE_TSAN)
+        # Two race gates, not one. rations_racecheck is the AMP's — the channel-switch handshake
+        # between the audio thread and the priming worker. namp_chaincheck is the HOST's: an LV2
+        # plug-in's worker extension runs on a thread of ours, and a retired chain snapshot crosses
+        # from the audio thread to the builder through a lock-free queue. Different code, different
+        # threads, and a run of one says nothing about the other.
+        #
+        # The whole of NampRackHost is instrumented rather than just the tool, because the races
+        # worth finding are inside the library. A partly-instrumented binary reports what it can
+        # see, which is the shape of a clean run for the wrong reason.
+        foreach(_tsan rations_racecheck namp_chaincheck NampRackHost)
+            target_compile_options(${_tsan} PRIVATE -fsanitize=thread -g -O1)
+        endforeach()
+        foreach(_tsan rations_racecheck namp_chaincheck)
+            target_link_options(${_tsan} PRIVATE -fsanitize=thread)
+        endforeach()
+        target_compile_definitions(namp_chaincheck PRIVATE NAMPRACK_ALLOC_HARNESS=0)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -693,8 +876,10 @@ if(NOT WIN32)
     add_executable(namp-rack
         ${NAMPRACK_ROOT}/standalone/main.cpp
         ${NAMPRACK_ROOT}/standalone/audiobackend.h
-        ${NAMPRACK_ROOT}/standalone/runloop.h
-        ${NAMPRACK_ROOT}/standalone/runloop.cpp
+        ${NAMPRACK_ROOT}/standalone/eventloop.h
+        ${NAMPRACK_ROOT}/standalone/eventloop.cpp
+        ${NAMPRACK_ROOT}/standalone/editorframe.h
+        ${NAMPRACK_ROOT}/standalone/editorframe.cpp
         ${NAMPRACK_ROOT}/standalone/midiroute.h
         ${NAMPRACK_ROOT}/standalone/midiroute.cpp
         ${NAMPRACK_ROOT}/standalone/jackclient.h
