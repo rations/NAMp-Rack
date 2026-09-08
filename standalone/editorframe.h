@@ -33,6 +33,14 @@
 // including a width the editor never asked for, and the editor's own letterbox fallback handles
 // that unchanged. Nothing here is baked into the drawing code.
 //
+// THE STRIP IS PART OF THE WINDOW'S SHAPE, so it is worked out here and nowhere else. The top-level
+// is the editor with the rack under it, and the two are one logical canvas at one scale — so the
+// strip's height is not free either: it follows the WIDTH, which is the only degree of freedom the
+// pair has. Every place a size arrives — a page change, the window manager, the initial embedding —
+// goes through the same three lines: the window is editorH + stripHeightFor(width) tall, the editor
+// gets the top of it, the strip gets the rest. Splitting that across two files is how the strip
+// ends up a few pixels adrift at one scale and not another.
+//
 // Reference: the SDK's own editorhost sample implements the same interface at
 // public.sdk/samples/vst-hosting/editorhost/source/platform/linux/.
 
@@ -44,6 +52,8 @@
 
 #include <X11/Xlib.h>
 
+#include <functional>
+
 namespace Rations
 {
 
@@ -53,10 +63,24 @@ class EditorFrame : public Steinberg::IPlugFrame
 public:
     explicit EditorFrame(EventLoop &loop);
 
+    // Where the strip below the editor should be put, in PIXELS, plus the logical-to-pixel factor
+    // it shares with the editor. Called on every size change and once at embedding time.
+    using StripPlacement = std::function<void(int x, int y, int w, int h, double scale)>;
+    // `canvasW` is the width both the editor and the strip are laid out in — one logical canvas —
+    // and `stripH` the strip's height in those same units. Set before setEmbedding(); leaving it
+    // unset means there is no strip and the window is the editor's alone, which is what the
+    // offline tools and a bundle under a DAW get.
+    void setStrip(int canvasW, int stripH, StripPlacement place);
+
     // The top-level window the editor was embedded into, and the view inside it. Set once, after
     // the view has attached: resizeView cannot do its job without both, and until it is called a
     // resize request is refused rather than acted on half-way.
     void setEmbedding(::Window window, Steinberg::IPlugView *view);
+
+    // The strip's height at a given window width, in pixels. Public because the caller has to
+    // create the top-level at the right size before there is a frame to ask, and a second spelling
+    // of this arithmetic somewhere else is exactly what the note at the top of this file is about.
+    int stripHeightFor(int windowW) const;
 
     // The window manager has resized the top-level. Runs the new size through the view's own
     // constraint and tells the view about it. A size we ourselves just applied is ignored, which
@@ -95,8 +119,14 @@ private:
     void trace(const char *fmt, ...) const;
 
     // Resize the X window and remember the size, so the ConfigureNotify it provokes is recognised
-    // as ours rather than treated as the user dragging the frame.
+    // as ours rather than treated as the user dragging the frame. Both are WINDOW sizes: the strip
+    // is inside them.
     void applySize(int w, int h);
+    // Put the strip under the editor at whatever the window is now. Harmless when there is none.
+    void placeStrip();
+    // Run `rect` through the view's own size constraint until the answer stops changing. See the
+    // definition for why one pass is not enough.
+    bool constrainToFixedPoint(Steinberg::ViewRect &rect) const;
     // Tell the window manager the smallest size the CURRENT page can be drawn at. The view is the
     // authority on that: checkSizeConstraint clamps whatever it is given up to the page's own
     // floor, and that floor differs per page — the page that scrolls has a much shorter one,
@@ -106,12 +136,23 @@ private:
     EventLoop &mLoop;
     ::Window mWindow = 0;
     Steinberg::IPlugView *mView = nullptr;
+    // The WINDOW size we last asked for — editor plus strip — and the editor's own height inside
+    // it. The editor's width is the window's; that is the whole policy above.
     int mAppliedW = 0;
     int mAppliedH = 0;
+    int mEditorH = 0;
     // The one width, per the policy at the top of this file. Taken from the window at
     // setEmbedding() time and thereafter changed only by the user dragging the frame — never by a
     // page change, which is the whole point.
     int mLockedW = 0;
+    // The last shape this frame asked the window manager for, so a target is requested once and
+    // then accepted however it comes back. -1 means nothing is outstanding. See windowConfigured.
+    int mRequestedW = -1;
+    int mRequestedH = -1;
+    // The strip. Zero height means there is none.
+    int mCanvasW = 0;
+    int mStripH = 0;
+    StripPlacement mPlaceStrip;
     bool mTrace = false;
 };
 

@@ -21,14 +21,22 @@
 #include "jackclient.h"
 #include "midiroute.h"
 #include "editorframe.h"
+#include "rackwindow.h"
+#include "pluginwindow.h"
+#include "panelwindow.h"
+
+#include "rack/rackgeometry.h"
 #include "eventloop.h"
 
 #include "host/catalog.h"
+#include "host/pluginpaths.h"
+#include "host/rackpreset.h"
 #include "host/chainbuilder.h"
 #include "host/chainengine.h"
 #include "host/scanchild.h"
 
 #include "gfx/resourcestore.h"
+#include "platform/respath.h"
 #include "rationsids.h"
 #include "version.h"
 
@@ -619,6 +627,254 @@ private:
 };
 
 //------------------------------------------------------------------------
+// One hosted plug-in's editor window, whichever kind it turned out to need.
+//
+// Exactly one of the two is set. `window` is the plug-in's own editor embedded in a window of
+// ours; `panel` is the generic parameter list, for a plug-in that has no editor this host can
+// show. Both answer the same four verbs, which is why nothing below has to know which it got —
+// choosing between them happens once, in makeEditor(), and every other path stays
+// format-agnostic.
+struct HostedEditor {
+    uint64_t id = 0;
+    std::unique_ptr<Rations::PluginWindow> window;
+    std::unique_ptr<Rations::PanelWindow> panel;
+
+    bool isOpen() const
+    {
+        return window ? window->isOpen() : (panel && panel->isOpen());
+    }
+    bool open()
+    {
+        return window ? window->open() : (panel && panel->open());
+    }
+    void close()
+    {
+        if (window)
+            window->close();
+        if (panel)
+            panel->close();
+    }
+    void idle()
+    {
+        if (window)
+            window->idle();
+        if (panel)
+            panel->idle();
+    }
+};
+
+//------------------------------------------------------------------------
+// The rack strip's own tick: repaint if anything asked, and keep the diagnostic cost bars measured
+// against the period the audio thread is actually running at.
+class RackTicker : public Linux::ITimerHandler
+{
+public:
+    RackTicker(Rations::RackWindow &rack, Rations::AudioBackend &audio) : mRack(rack), mAudio(audio)
+    {
+    }
+
+    void PLUGIN_API onTimer() SMTG_OVERRIDE
+    {
+        // Re-pushed every tick rather than once at startup: the buffer size can change under a
+        // running client, and a cost bar drawn as a fraction of a stale period is a wrong number
+        // drawn confidently.
+        if (mAudio.isOpen())
+            mRack.setAudioPeriod(mAudio.sampleRate(), mAudio.blockSize());
+        mRack.onTimer();
+    }
+
+    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
+    {
+        if (!obj)
+            return kInvalidArgument;
+        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = static_cast<Linux::ITimerHandler *>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+
+private:
+    Rations::RackWindow &mRack;
+    Rations::AudioBackend &mAudio;
+};
+
+//------------------------------------------------------------------------
+// Drives every open hosted editor once per tick. Some formats need an idle callback to draw at all,
+// and a resize a plug-in latched from a thread we do not control is applied here.
+class EditorPump : public Linux::ITimerHandler
+{
+public:
+    using Windows = std::vector<HostedEditor>;
+
+    EditorPump(Windows &windows, Rations::RackWindow *rack) : mWindows(windows), mRack(rack)
+    {
+    }
+
+    void PLUGIN_API onTimer() SMTG_OVERRIDE
+    {
+        for (auto &hosted : mWindows) {
+            const bool wasOpen = hosted.isOpen();
+            hosted.idle();
+            // A plug-in's editor can close itself — the user clicks the title bar and the window
+            // handles it without telling anyone. The rack's gear would otherwise stay lit for a
+            // window that is gone.
+            if (mRack && wasOpen && !hosted.isOpen())
+                mRack->setEditorOpen(hosted.id, false);
+        }
+    }
+
+    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
+    {
+        if (!obj)
+            return kInvalidArgument;
+        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = static_cast<Linux::ITimerHandler *>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+
+private:
+    Windows &mWindows;
+    Rations::RackWindow *mRack = nullptr;
+};
+
+//------------------------------------------------------------------------
+// Opens and closes every hosted editor over and over, which is the only way to prove the teardown
+// order holds. editorClose() -> removeWindow() -> XDestroyWindow() is load-bearing: destroy the X
+// window before telling the plug-in to close its editor and its timer fires against a window that
+// no longer exists, which is a crash inside somebody else's code with our stack nowhere in the
+// backtrace. Reading the source cannot show that; cycling it can.
+class EditorCycler : public Linux::ITimerHandler
+{
+public:
+    using Windows = std::vector<HostedEditor>;
+
+    EditorCycler(Windows &windows, Rations::EventLoop &loop, int cycles)
+        : mWindows(windows), mLoop(loop), mCycles(cycles)
+    {
+    }
+
+    void PLUGIN_API onTimer() SMTG_OVERRIDE
+    {
+        if (mTick == 0) {
+            int opened = 0;
+            for (auto &hosted : mWindows)
+                opened += hosted.open() ? 1 : 0;
+            if (mCycle == 0)
+                mOpenedFirstCycle = opened;
+            else if (opened != mOpenedFirstCycle)
+                // A window that opened once and will not open again is exactly the failure this
+                // test exists to catch, and it does not show up as a leak.
+                fprintf(stderr, "namp-rack: cycle %d opened %d editor(s), the first opened %d\n",
+                        mCycle + 1, opened, mOpenedFirstCycle);
+        } else if (mTick == kOpenTicks) {
+            for (auto &hosted : mWindows)
+                hosted.close();
+        }
+
+        if (++mTick < kOpenTicks + kClosedTicks)
+            return;
+
+        mTick = 0;
+        if (++mCycle >= mCycles) {
+            mDone = true;
+            mLoop.stop();
+        }
+    }
+
+    bool finished() const
+    {
+        return mDone;
+    }
+    int openedPerCycle() const
+    {
+        return mOpenedFirstCycle;
+    }
+    int completedCycles() const
+    {
+        return mCycle;
+    }
+
+    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
+    {
+        if (!obj)
+            return kInvalidArgument;
+        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = static_cast<Linux::ITimerHandler *>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+
+private:
+    // Long enough at the UI tick for a view to register its handlers, receive its first X events
+    // and paint at least once; short enough that a hundred cycles is still seconds rather than
+    // minutes.
+    static constexpr int kOpenTicks = 8;
+    static constexpr int kClosedTicks = 2;
+
+    Windows &mWindows;
+    Rations::EventLoop &mLoop;
+    int mCycles;
+    int mCycle = 0;
+    int mTick = 0;
+    int mOpenedFirstCycle = 0;
+    bool mDone = false;
+};
+
+//------------------------------------------------------------------------
+// Where plug-ins are looked for, as the overlay lists it. The automatic rows are the ones discovery
+// reaches on its own — measured by the host layer rather than declared here — and cannot be
+// removed, because removing something nobody added is not a thing this host can do. They are listed
+// anyway: without them the list reads as though the rack only looks where it was pointed, which
+// would have people adding ~/.vst3 by hand.
+std::vector<NAMp::rack::SearchPathRow> buildSearchPathRows(const NAMp::host::PluginPaths &paths)
+{
+    std::vector<NAMp::rack::SearchPathRow> rows;
+    for (const std::string &dir : NAMp::host::automaticVst3Roots())
+        rows.push_back({dir, "VST3", true});
+    for (const std::string &dir : NAMp::host::automaticLv2Roots())
+        rows.push_back({dir, "LV2", true});
+    // A user folder carries no format tag: it is offered to every scanner, which is why adding one
+    // does not make anybody choose a format they have no way of knowing yet.
+    for (const std::string &dir : paths.roots())
+        rows.push_back({dir, std::string(), false});
+    return rows;
+}
+
+//------------------------------------------------------------------------
 struct Options {
     // An external .vst3 to host INSTEAD of the amp linked in. Empty is the normal case. It exists
     // so a build of the amp made somewhere else can be driven by this rig without reinstalling
@@ -638,6 +894,22 @@ struct Options {
     double rackStressSeconds = 0.0;
     // Churn by toggling the node's enabled flag rather than by loading and unloading it.
     bool rackStressByEnable = false;
+    // The saved rack to start from and write back to. Empty means "default", so a chain survives a
+    // restart the same way a capture bank does — a pedalboard you have to rebuild every time you
+    // start is not a pedalboard.
+    std::string rack;
+    // Open every hosted plug-in's editor at startup, rather than waiting for the gear to be
+    // clicked. For looking at one without driving the rack first.
+    bool showEditors = false;
+    // Open and close every hosted editor this many times, then report and exit. This is the gate on
+    // the teardown order, which cannot be proved by reading it.
+    int editorCycles = 0;
+    // Use the generic parameter panel for every plug-in, even one that has an editor of its own.
+    // A plug-in's own editor can be broken, unreadable at this screen's size, or simply worse than
+    // a list of its parameters, and the panel is built from the backend interface so it always
+    // works. It is also the only way to reach the no-editor branch on a machine where every
+    // installed plug-in happens to have one.
+    bool genericPanel = false;
 };
 
 void printUsage()
@@ -657,6 +929,12 @@ void printUsage()
            "                order given is the order they run in\n"
            "  --post NAME   the same, after the amp\n"
            "  --list        list every plug-in the scan found, and exit\n"
+           "  --rack NAME   start from the saved rack NAME and write it back on exit\n"
+           "                (default: 'default'; --pre/--post override it for this run)\n"
+           "  --editors     open every hosted plug-in's editor at startup\n"
+           "  --generic-panel  show the parameter list instead of a plug-in's own editor\n"
+           "  --editor-cycles N  open and close every hosted editor N times, then report and\n"
+           "                exit; the gate on the editor teardown order\n"
            "  --rack-stress S  add and remove the first --post plug-in for S seconds with audio\n"
            "                running, then report the dropout count and exit\n"
            "  --rack-stress-enable  as above, but toggle the node's enabled flag instead, so the\n"
@@ -689,6 +967,34 @@ ArgResult parseArgs(int argc, char **argv, Options &opt)
         }
         if (arg == "--list") {
             opt.listPlugins = true;
+            continue;
+        }
+        if (arg == "--editors") {
+            opt.showEditors = true;
+            continue;
+        }
+        if (arg == "--generic-panel") {
+            opt.genericPanel = true;
+            continue;
+        }
+        if (arg == "--rack") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "namp-rack: --rack needs the name of a saved rack\n");
+                return ArgResult::Error;
+            }
+            opt.rack = argv[++i];
+            continue;
+        }
+        if (arg == "--editor-cycles") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "namp-rack: --editor-cycles needs a count\n");
+                return ArgResult::Error;
+            }
+            opt.editorCycles = std::atoi(argv[++i]);
+            if (opt.editorCycles <= 0) {
+                fprintf(stderr, "namp-rack: --editor-cycles needs a positive count\n");
+                return ArgResult::Error;
+            }
             continue;
         }
         if (arg == "--rack-stress-enable") {
@@ -748,15 +1054,26 @@ int main(int argc, char **argv)
             break;
     }
 
+    // Where plug-ins are looked for, and what was found there. Both outlive everything that reads
+    // them, which is why they are here rather than beside the chain: the rack's model holds a
+    // pointer to the catalogue's entries and to the path rows, and a scan asked for from the strip
+    // refills these same objects in place.
+    NAMp::host::PluginPaths pluginPaths;
+    const std::string pluginPathsFile = NAMp::host::PluginPaths::defaultFile();
+    pluginPaths.load(pluginPathsFile);
+    NAMp::host::Catalog catalog;
+    catalog.setSearchPaths(&pluginPaths);
+    std::vector<NAMp::rack::SearchPathRow> searchPathRows = buildSearchPathRows(pluginPaths);
+
     // Answered before the amp, the audio device or the window exist, because it needs none of them
     // and a scan that had to open a JACK connection first would be a scan nobody could run.
     if (opt.listPlugins) {
-        NAMp::host::Catalog catalog;
         catalog.rescan();
         for (const auto &entry : catalog.entries())
             printf("%-5s %-40s %s\n", NAMp::host::formatTag(entry.ref.format), entry.name.c_str(),
                    entry.ref.key.c_str());
-        printf("\n%zu plug-in(s)\n", catalog.entries().size());
+        printf("\n%zu plug-in(s); %d probed; %d new since the last scan\n",
+               catalog.entries().size(), catalog.probedCount(), catalog.newCount());
         return 0;
     }
 
@@ -889,10 +1206,14 @@ int main(int argc, char **argv)
     chainBuilder.setEngine(&chainEngine);
     chainBuilder.configure(sampleRate, blockSize);
 
-    if (!opt.pre.empty() || !opt.post.empty()) {
-        NAMp::host::Catalog catalog;
-        catalog.rescan();
+    // One scan for the whole run, whether or not the command line names a plug-in: the rack's
+    // picker lists what this finds, and a warm rescan probes zero bundles, so the cost of doing it
+    // unconditionally is reading a cache file.
+    catalog.rescan();
+    printf("namp-rack: %zu plug-in(s); %d probed; %d new\n", catalog.entries().size(),
+           catalog.probedCount(), catalog.newCount());
 
+    if (!opt.pre.empty() || !opt.post.empty()) {
         const struct {
             const std::vector<std::string> &specs;
             NAMp::host::ChainSection section;
@@ -919,6 +1240,45 @@ int main(int argc, char **argv)
         chainBuilder.publish();
     }
 
+    // --- the saved rack ----------------------------------------------
+    // The command line wins. --pre/--post describe a chain explicitly, and merging a saved rack
+    // into it would produce something the user did not ask for and cannot see the reason for.
+    const std::string rackName = opt.rack.empty() ? std::string("default") : opt.rack;
+    std::vector<std::string> savedRacks = NAMp::host::listRacks();
+    const bool rackFromCommandLine = !opt.pre.empty() || !opt.post.empty();
+
+    auto loadRackNamed = [&](const std::string &name) {
+        const std::string path = NAMp::host::rackPath(name);
+        if (path.empty())
+            return false;
+        NAMp::host::ApplyReport report;
+        std::string error;
+        if (!NAMp::host::loadRack(chainBuilder, path, report, error)) {
+            fprintf(stderr, "namp-rack: cannot load the rack '%s': %s\n", name.c_str(),
+                    error.c_str());
+            return false;
+        }
+        printf("namp-rack: rack '%s' - %d plug-in(s), %d placeholder(s), %d skipped\n",
+               name.c_str(), report.loaded, report.placeholders, report.skipped);
+        audio.notifyLatencyChanged();
+        return true;
+    };
+
+    if (opt.useState && !rackFromCommandLine) {
+        const bool exists =
+            std::find(savedRacks.begin(), savedRacks.end(), rackName) != savedRacks.end();
+        if (exists)
+            loadRackNamed(rackName);
+        else if (!opt.rack.empty())
+            fprintf(stderr, "namp-rack: no saved rack called '%s'; starting empty\n",
+                    rackName.c_str());
+    } else if (rackFromCommandLine && !opt.rack.empty()) {
+        fprintf(stderr,
+                "namp-rack: --pre/--post were given, so the saved rack '%s' was not loaded; it "
+                "will still be written on exit\n",
+                rackName.c_str());
+    }
+
     audio.setChainEngine(&chainEngine);
 
     if (probe && !audio.open("NAMp-Rack", processor, component, &route))
@@ -939,16 +1299,36 @@ int main(int argc, char **argv)
         view = nullptr;
     }
 
-    int winW = kFallbackW;
-    int winH = kFallbackH;
+    int editorW = kFallbackW;
+    int editorH = kFallbackH;
     if (view) {
         ViewRect wanted = {};
         if (view->getSize(&wanted) == kResultTrue && wanted.getWidth() > 0 &&
             wanted.getHeight() > 0) {
-            winW = wanted.getWidth();
-            winH = wanted.getHeight();
+            editorW = wanted.getWidth();
+            editorH = wanted.getHeight();
         }
     }
+
+    // The loop and the frame are built BEFORE the window, which they do not touch until
+    // setEmbedding(): the frame is what knows how tall the strip under the editor is, and the
+    // window has to be created at editor-plus-strip or the first thing the user sees is a window
+    // that resizes itself. One loop for the process, one frame for this view — separate objects
+    // because the two interfaces have different multiplicities; see eventloop.h.
+    Rations::EventLoop eventLoop(display);
+    Rations::EditorFrame frame(eventLoop);
+    Rations::RackWindow rack(eventLoop, chainBuilder);
+
+    // The strip is laid out in the editor's own logical units and drawn at the editor's own scale,
+    // which is what makes the two one picture rather than two that agree at 1.0 and nowhere else.
+    // From here on the frame owns the whole window's shape: it grants the editor a height, works
+    // out the strip's from the width, and calls back to place it.
+    frame.setStrip(
+        Rations::geo::kWinW, NAMp::rackgeo::kRackH,
+        [&rack](int x, int y, int w, int h, double scale) { rack.setGeometry(x, y, w, h, scale); });
+
+    const int winW = editorW;
+    const int winH = editorH + frame.stripHeightFor(editorW);
 
     const int screen = DefaultScreen(display);
     ::Window window = XCreateSimpleWindow(
@@ -969,10 +1349,6 @@ int main(int argc, char **argv)
     XMapWindow(display, window);
     XFlush(display);
 
-    // One loop for the process, one frame for this view. They are separate objects because the
-    // two interfaces have different multiplicities — see eventloop.h.
-    Rations::EventLoop eventLoop(display);
-    Rations::EditorFrame frame(eventLoop);
     gEventLoop = &eventLoop;
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
@@ -985,13 +1361,187 @@ int main(int argc, char **argv)
             view = nullptr;
         }
     }
+    // --- the rack strip ----------------------------------------------
+    // Created before setEmbedding(), because that is what places it for the first time. A child of
+    // the top-level and a SIBLING of whatever window the editor made inside it: the editor handles
+    // its own input on its own connection, so the two paths never have to be told apart.
+    rack.loadFonts(Rations::resourceDir());
+    rack.setCatalog(&catalog.entries());
+    rack.setSearchPaths(&searchPathRows);
+    rack.setPresets(&savedRacks);
+    rack.setPresetName(rackName);
+    if (!rack.create(window, 0, editorH, winW, frame.stripHeightFor(winW)))
+        fprintf(stderr, "namp-rack: the rack strip has no window; the amp still runs\n");
+
     // Only now: the run loop cannot resize a window the view has not attached to, and every page
-    // change arrives as exactly that request. This is also where the window takes its one width.
+    // change arrives as exactly that request. This is also where the window takes its one width,
+    // and where the strip is put under the editor for the first time.
     if (view)
         frame.setEmbedding(window, view);
 
+    // --- hosted editors ----------------------------------------------
+    // One window per hosted plug-in, created on demand and keyed by the node's stable id. The rack
+    // can reorder or remove nodes underneath these, so an index would start naming the wrong
+    // plug-in the moment it did.
+    std::vector<HostedEditor> editorWindows;
+
+    // A plug-in with no editor this host can show gets the generic parameter panel instead of
+    // nothing. Choosing here — once, at the only place a window is created — is what keeps every
+    // other path format-agnostic.
+    auto makeEditor = [&](uint64_t id, NAMp::host::PluginBackend &backend) {
+        HostedEditor hosted;
+        hosted.id = id;
+        const bool noEditor = backend.editorKind() == NAMp::host::EditorKind::NoEditor;
+        if (noEditor || opt.genericPanel) {
+            hosted.panel = std::make_unique<Rations::PanelWindow>(eventLoop, backend);
+            hosted.panel->loadFonts(Rations::resourceDir());
+            if (noEditor)
+                fprintf(stderr,
+                        "namp-rack: %s has no editor this host can show; using the generic "
+                        "parameter panel\n",
+                        backend.displayName());
+        } else {
+            hosted.window = std::make_unique<Rations::PluginWindow>(eventLoop, backend);
+        }
+        return hosted;
+    };
+
+    auto findEditor = [&editorWindows](uint64_t id) -> HostedEditor * {
+        for (HostedEditor &hosted : editorWindows)
+            if (hosted.id == id)
+                return &hosted;
+        return nullptr;
+    };
+
+    // Called immediately BEFORE a node's instance leaves the chain. A hosted editor window holds a
+    // reference to its backend, so a window left open across a removal would be pointing at an
+    // object the builder is about to bury and then free.
+    auto closeEditorFor = [&](uint64_t id) {
+        for (size_t i = 0; i < editorWindows.size(); ++i) {
+            if (editorWindows[i].id != id)
+                continue;
+            editorWindows[i].close();
+            editorWindows.erase(editorWindows.begin() + static_cast<long>(i));
+            rack.setEditorOpen(id, false);
+            return;
+        }
+    };
+
+    auto toggleEditorFor = [&](NAMp::host::ChainSection section, int index) {
+        const uint64_t id = rack.nodeIdAt(section, index);
+        if (id == 0)
+            return;
+        if (HostedEditor *hosted = findEditor(id)) {
+            if (hosted->isOpen()) {
+                closeEditorFor(id);
+                return;
+            }
+            rack.setEditorOpen(id, hosted->open());
+            return;
+        }
+        NAMp::host::PluginBackend *backend = chainBuilder.backend(section, index);
+        if (!backend)
+            return;
+        HostedEditor hosted = makeEditor(id, *backend);
+        const bool opened = hosted.open();
+        rack.setEditorOpen(id, opened);
+        if (opened)
+            editorWindows.push_back(std::move(hosted));
+    };
+
+    // --- saving, and where plug-ins are looked for --------------------
+    auto refreshRackList = [&]() {
+        savedRacks = NAMp::host::listRacks();
+        rack.setPresets(&savedRacks);
+    };
+
+    auto saveRackAs = [&](const std::string &name) {
+        const std::string path = NAMp::host::rackPath(name);
+        std::string error;
+        if (path.empty() || !NAMp::host::saveRack(chainBuilder, path, error)) {
+            fprintf(stderr, "namp-rack: cannot save the rack '%s': %s\n", name.c_str(),
+                    error.empty() ? "no usable rack directory" : error.c_str());
+            return;
+        }
+        printf("namp-rack: saved the rack to %s\n", path.c_str());
+        refreshRackList();
+    };
+
+    // A scan is synchronous and can take seconds when a bundle has changed, so it draws its own
+    // progress: the callback paints and blits the strip directly, because the run loop is inside
+    // the scan and will not tick again until it returns.
+    auto scanPlugins = [&]() {
+        rack.showScanProgress(0, 0, std::string());
+        catalog.rescan([&](const NAMp::host::ScanProgress &progress) {
+            rack.showScanProgress(progress.index, progress.total, progress.current);
+        });
+        rack.endScanProgress();
+        printf("namp-rack: %zu plug-in(s); %d probed; %d new\n", catalog.entries().size(),
+               catalog.probedCount(), catalog.newCount());
+        rack.invalidate();
+    };
+
+    auto addSearchPath = [&](const std::string &dir) {
+        std::string error;
+        if (!pluginPaths.add(dir, error)) {
+            fprintf(stderr, "namp-rack: cannot search %s: %s\n", dir.c_str(), error.c_str());
+            return;
+        }
+        if (!pluginPaths.save(pluginPathsFile))
+            fprintf(stderr, "namp-rack: could not write %s\n", pluginPathsFile.c_str());
+        searchPathRows = buildSearchPathRows(pluginPaths);
+        rack.setSearchPaths(&searchPathRows);
+        // Scanned straight away rather than waiting for the user to press Scan: they have just
+        // pointed at a folder, and the only reason to do that is to get what is in it. Requested
+        // rather than run, because this is reached from a click and nothing may paint there.
+        rack.requestScan();
+    };
+
+    auto removeSearchPath = [&](const std::string &dir) {
+        if (!pluginPaths.remove(dir))
+            return;
+        if (!pluginPaths.save(pluginPathsFile))
+            fprintf(stderr, "namp-rack: could not write %s\n", pluginPathsFile.c_str());
+        searchPathRows = buildSearchPathRows(pluginPaths);
+        rack.setSearchPaths(&searchPathRows);
+        // A rescan is what actually drops those plug-ins out of the picker; without it the folder
+        // is gone from the list and its contents are still offered, which is worse than either.
+        rack.requestScan();
+    };
+
+    rack.setEditorToggle(toggleEditorFor);
+    rack.setEditorClose(closeEditorFor);
+    rack.setPresetHandlers(loadRackNamed, saveRackAs);
+    rack.setDiscoveryHandlers(scanPlugins, addSearchPath, removeSearchPath);
+    rack.setChainChanged([&audio]() { audio.notifyLatencyChanged(); });
+    rack.refreshModel();
+
+    if (opt.showEditors || opt.editorCycles > 0) {
+        // Pre-created for whatever the command line or the saved rack put in the chain, so
+        // --editors and --editor-cycles have something to drive before the rack has been touched.
+        for (const auto section : {NAMp::host::ChainSection::Pre, NAMp::host::ChainSection::Post}) {
+            const int nodes = chainBuilder.count(section);
+            for (int i = 0; i < nodes; ++i) {
+                NAMp::host::PluginBackend *backend = chainBuilder.backend(section, i);
+                if (!backend)
+                    continue;
+                editorWindows.push_back(makeEditor(rack.nodeIdAt(section, i), *backend));
+            }
+        }
+    }
+    if (opt.showEditors) {
+        for (auto &hosted : editorWindows)
+            rack.setEditorOpen(hosted.id, hosted.open());
+    }
+
     FeedbackPump feedback(audio, controller);
     eventLoop.registerTimer(&feedback, kUiTickMs);
+
+    RackTicker rackTicker(rack, audio);
+    eventLoop.registerTimer(&rackTicker, kUiTickMs);
+
+    EditorPump editorPump(editorWindows, &rack);
+    eventLoop.registerTimer(&editorPump, kUiTickMs);
 
     ChainCollector collector(chainBuilder);
     eventLoop.registerTimer(&collector, kUiTickMs);
@@ -1013,6 +1563,15 @@ int main(int argc, char **argv)
     BufferSizeWatcher blockWatcher(audio, component, processor, setup, chainEngine, chainBuilder);
     if (audio.isOpen())
         eventLoop.registerTimer(&blockWatcher, kUiTickMs);
+
+    EditorCycler cycler(editorWindows, eventLoop, opt.editorCycles);
+    if (opt.editorCycles > 0) {
+        if (editorWindows.empty()) {
+            fprintf(stderr, "namp-rack: --editor-cycles needs at least one plug-in in the rack\n");
+            return 2;
+        }
+        eventLoop.registerTimer(&cycler, kUiTickMs);
+    }
 
     // Registered against THIS window rather than as a single global callback: the loop dispatches
     // by XEvent::xany.window, so a second top-level cannot end up in the same handler.
@@ -1036,12 +1595,31 @@ int main(int argc, char **argv)
     eventLoop.run();
 
     // --- teardown ----------------------------------------------------
+    if (opt.editorCycles > 0)
+        eventLoop.unregisterTimer(&cycler);
     if (audio.isOpen())
         eventLoop.unregisterTimer(&blockWatcher);
     if (opt.rackStressSeconds > 0.0)
         eventLoop.unregisterTimer(&rackStress);
+    eventLoop.unregisterTimer(&editorPump);
+    eventLoop.unregisterTimer(&rackTicker);
     eventLoop.unregisterTimer(&collector);
     eventLoop.unregisterTimer(&feedback);
+
+    // EVERY HOSTED EDITOR GOES FIRST, AND IN ITS OWN ORDER. close() tells the plug-in to shut its
+    // editor down before this host stops dispatching to the window and long before the window is
+    // destroyed — the view unregisters its own run-loop handlers from inside that call, so the loop
+    // and the frame have to still be alive when it happens. Destroying the window first leaves a
+    // plug-in's timer firing against a window that no longer exists, which is a crash inside
+    // somebody else's code with our stack nowhere in the backtrace.
+    for (auto &hosted : editorWindows)
+        hosted.close();
+    editorWindows.clear();
+
+    // The strip lets go of its own window before the top-level it is a child of is destroyed, for
+    // the same reason and in the same order.
+    rack.destroy();
+
     if (view) {
         view->removed();
         view = nullptr;
@@ -1055,6 +1633,12 @@ int main(int argc, char **argv)
                audio.blockSize());
     }
 
+    if (opt.editorCycles > 0)
+        printf("namp-rack: %d editor open/close cycle%s, %d editor%s per cycle%s\n",
+               cycler.completedCycles(), cycler.completedCycles() == 1 ? "" : "s",
+               cycler.openedPerCycle(), cycler.openedPerCycle() == 1 ? "" : "s",
+               cycler.finished() ? "" : " (interrupted)");
+
     audio.close();
     // The audio thread is gone, so nothing can still be holding a snapshot: collectAll frees
     // everything outstanding whether or not the engine handed it back, which collect() alone
@@ -1067,8 +1651,17 @@ int main(int argc, char **argv)
     component->setActive(false);
     // With the audio thread gone and the component inactive, so nothing is moving underneath the
     // blob being written.
-    if (opt.useState)
+    if (opt.useState) {
         saveState(component);
+        // The rack too, and after the audio thread has stopped for the same reason: nothing is
+        // moving underneath what is being written. A chain the user built and did not explicitly
+        // save is still the chain they were using.
+        std::string rackError;
+        const std::string path = NAMp::host::rackPath(rackName);
+        if (path.empty() || !NAMp::host::saveRack(chainBuilder, path, rackError))
+            fprintf(stderr, "namp-rack: could not save the rack '%s': %s\n", rackName.c_str(),
+                    rackError.empty() ? "no usable rack directory" : rackError.c_str());
+    }
     controller->setComponentHandler(nullptr);
 
     // The window stops being dispatched to BEFORE it is destroyed, so nothing can be handed an

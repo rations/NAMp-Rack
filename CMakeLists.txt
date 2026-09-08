@@ -287,6 +287,11 @@ add_library(NampRackGfx STATIC
     ${NAMPRACK_ROOT}/src/gfx/resourcestore.h
     ${NAMPRACK_ROOT}/src/gfx/resourcestore.cpp
     ${NAMPRACK_ROOT}/src/platform/respath.cpp
+    # The in-plug-in file browser lives here rather than with the plug-in because it is drawn with
+    # Canvas and nothing else, and the rack needs the same one to choose a plug-in search folder.
+    # Two browsers would drift, and the one the user already knows is the one the rack should open.
+    ${NAMPRACK_ROOT}/src/filebrowser.h
+    ${NAMPRACK_ROOT}/src/filebrowser.cpp
 )
 target_include_directories(NampRackGfx PUBLIC ${NAMPRACK_ROOT}/src)
 target_link_libraries(NampRackGfx PUBLIC PkgConfig::CAIROFT ${CMAKE_DL_LIBS})
@@ -424,8 +429,6 @@ set(NAMPRACK_PLUGIN_SOURCES
     src/midilearn.cpp
     src/rationsview.h
     src/rationsview.cpp
-    src/filebrowser.h
-    src/filebrowser.cpp
     src/platform/plugview.h
     ${NAMPRACK_PLATFORM_VIEW_SOURCES}
 )
@@ -670,6 +673,27 @@ if(_namprack_host_flags MATCHES "ffast-math|ffinite-math-only")
 endif()
 
 # ---------------------------------------------------------------------------
+# NampRackRack — the rack strip's model and its drawing. Links NampRackGfx (cairo/freetype) and
+# NampRackHost (the chain it displays) and NOTHING ELSE: no X11, no JACK, no windowing. That is
+# what lets rackrender drive the whole interface offline with no plug-in installed, and it is the
+# same separation the amp's own editor already has between what draws and what embeds.
+# ---------------------------------------------------------------------------
+add_library(NampRackRack STATIC
+    ${NAMPRACK_ROOT}/src/rack/genericpanel.h
+    ${NAMPRACK_ROOT}/src/rack/genericpanel.cpp
+    ${NAMPRACK_ROOT}/src/rack/rackgeometry.h
+    ${NAMPRACK_ROOT}/src/rack/rackmodel.h
+    ${NAMPRACK_ROOT}/src/rack/rackmodel.cpp
+    ${NAMPRACK_ROOT}/src/rack/rackview.h
+    ${NAMPRACK_ROOT}/src/rack/rackview.cpp
+)
+target_include_directories(NampRackRack PUBLIC ${NAMPRACK_ROOT}/src)
+target_link_libraries(NampRackRack PUBLIC NampRackGfx NampRackHost)
+target_compile_features(NampRackRack PUBLIC cxx_std_17)
+set_target_properties(NampRackRack PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_options(NampRackRack PRIVATE -Wall)
+
+# ---------------------------------------------------------------------------
 # Tools: the offline proofs and the panel render.
 # ---------------------------------------------------------------------------
 if(NAMPRACK_BUILD_TOOLS)
@@ -774,6 +798,22 @@ if(NAMPRACK_BUILD_TOOLS)
     target_link_libraries(panelrender PRIVATE NampRackGfx)
     target_include_directories(panelrender PRIVATE ${VST3_SDK_DIR})
     target_compile_options(panelrender PRIVATE -Wall)
+
+    # ---------------------------------------------------------------------------
+    # rackrender — the rack's offline render, the counterpart to panelrender. It builds a chain out
+    # of nothing (a ChainBuilder with no engine and no plug-ins loaded), drives the real RackView
+    # through it, and writes a PNG per view. That is the phase gate for the rack UI: the interface
+    # can be judged, and its layout regression-checked, with no X server, no JACK and no plug-in
+    # installed.
+    # ---------------------------------------------------------------------------
+    add_executable(rackrender
+        ${NAMPRACK_ROOT}/tools/rackrender.cpp
+        ${NAMPRACK_ROOT}/src/host/hostiids.cpp
+        ${VST3_SDK_DIR}/public.sdk/samples/vst-hosting/editorhost/source/usediids.cpp
+    )
+    target_link_libraries(rackrender PRIVATE NampRackRack)
+    target_compile_features(rackrender PRIVATE cxx_std_17)
+    target_compile_options(rackrender PRIVATE -Wall)
 
     # ---------------------------------------------------------------------------
     # namp_hostcheck — the host phase gate. Links NampRackHost and NOTHING ELSE, which is not a
@@ -882,6 +922,16 @@ if(NOT WIN32)
         ${NAMPRACK_ROOT}/standalone/eventloop.cpp
         ${NAMPRACK_ROOT}/standalone/editorframe.h
         ${NAMPRACK_ROOT}/standalone/editorframe.cpp
+        # The rack strip's window and the two kinds of window a hosted plug-in's editor can need:
+        # its own, or the generic parameter panel when it has no editor this host can show.
+        ${NAMPRACK_ROOT}/standalone/plugframe.h
+        ${NAMPRACK_ROOT}/standalone/plugframe.cpp
+        ${NAMPRACK_ROOT}/standalone/rackwindow.h
+        ${NAMPRACK_ROOT}/standalone/rackwindow.cpp
+        ${NAMPRACK_ROOT}/standalone/pluginwindow.h
+        ${NAMPRACK_ROOT}/standalone/pluginwindow.cpp
+        ${NAMPRACK_ROOT}/standalone/panelwindow.h
+        ${NAMPRACK_ROOT}/standalone/panelwindow.cpp
         ${NAMPRACK_ROOT}/standalone/midiroute.h
         ${NAMPRACK_ROOT}/standalone/midiroute.cpp
         ${NAMPRACK_ROOT}/standalone/jackclient.h
@@ -897,6 +947,7 @@ if(NOT WIN32)
         PRIVATE
             NampRackPlugin
             NampRackResources
+            NampRackRack
             NampRackHost
             sdk_hosting
             PkgConfig::NAMPRACK_JACK
@@ -935,5 +986,5 @@ endif()
 message(STATUS "[NAMp-Rack]   validator bundle ${NAMPRACK_BUILD_VST3_BUNDLE} (never packaged)")
 message(STATUS "[NAMp-Rack]   tools           ${NAMPRACK_BUILD_TOOLS}")
 message(STATUS "[NAMp-Rack]   bundled pedals  ${NAMPRACK_BUILD_PEDALS}")
-message(STATUS "[NAMp-Rack] amp + standalone + tools; the host layer is not built yet.")
+message(STATUS "[NAMp-Rack] amp + rack + standalone + tools.")
 message(STATUS "")

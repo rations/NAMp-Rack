@@ -4,6 +4,7 @@
 
 #include <X11/Xutil.h>
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +57,69 @@ tresult PLUGIN_API EditorFrame::queryInterface(const TUID iid, void **obj)
 }
 
 //------------------------------------------------------------------------
+void EditorFrame::setStrip(int canvasW, int stripH, StripPlacement place)
+{
+    mCanvasW = canvasW > 0 ? canvasW : 0;
+    mStripH = stripH > 0 ? stripH : 0;
+    mPlaceStrip = std::move(place);
+}
+
+//------------------------------------------------------------------------
+// The strip is laid out in the same logical units as the editor and drawn at the same scale, so its
+// pixel height is its logical height times the window's scale — and the window's scale is its width
+// over the canvas width. Rounded rather than truncated: a strip a pixel short leaves a line of the
+// window's own background showing under it, which reads as a gap rather than as rounding.
+int EditorFrame::stripHeightFor(int windowW) const
+{
+    if (mStripH <= 0 || mCanvasW <= 0 || windowW <= 0)
+        return 0;
+    return static_cast<int>(
+        std::lround(static_cast<double>(mStripH) * windowW / static_cast<double>(mCanvasW)));
+}
+
+//------------------------------------------------------------------------
+void EditorFrame::placeStrip()
+{
+    if (!mPlaceStrip || mAppliedW <= 0 || mEditorH <= 0)
+        return;
+    const int stripH = stripHeightFor(mAppliedW);
+    if (stripH <= 0)
+        return;
+    mPlaceStrip(0, mEditorH, mAppliedW, stripH,
+                static_cast<double>(mAppliedW) / static_cast<double>(mCanvasW));
+}
+
+//------------------------------------------------------------------------
+// ASK THE VIEW UNTIL ITS ANSWER STOPS MOVING, because one question is not enough and the second
+// answer is the one the window has to match.
+//
+// An aspect-locked page fits itself to whichever of the two axes is tighter, and the height it
+// returns is ROUNDED. Feed that rounded height back in and the height axis is now fractionally the
+// tighter one, so the width comes back a pixel smaller — which is exactly what happens, because the
+// view re-runs the same constraint inside onSize() on whatever it is handed. Measured: a window
+// dragged to 850 wide was granted 850x302 and drew itself 849 wide, leaving a one-pixel line of
+// window background down the right of the editor with a full-width strip beneath it.
+//
+// Iterating to a fixed point makes the frame ask the same question the view will ask itself, so the
+// two cannot disagree. It settles in two rounds for every page here; the cap is there because this
+// runs on the window manager's events and a view is not obliged to converge.
+bool EditorFrame::constrainToFixedPoint(ViewRect &rect) const
+{
+    if (!mView)
+        return false;
+    for (int round = 0; round < 4; ++round) {
+        const int w = rect.getWidth();
+        const int h = rect.getHeight();
+        if (mView->checkSizeConstraint(&rect) != kResultTrue)
+            return false;
+        if (rect.getWidth() == w && rect.getHeight() == h)
+            return true;
+    }
+    trace("constraint did not settle at %dx%d", rect.getWidth(), rect.getHeight());
+    return true;
+}
+
+//------------------------------------------------------------------------
 void EditorFrame::setEmbedding(::Window window, IPlugView *view)
 {
     mWindow = window;
@@ -64,13 +128,15 @@ void EditorFrame::setEmbedding(::Window window, IPlugView *view)
     ViewRect current = {};
     if (mView && mView->getSize(&current) == kResultTrue) {
         mAppliedW = current.getWidth();
-        mAppliedH = current.getHeight();
+        mEditorH = current.getHeight();
+        mAppliedH = mEditorH + stripHeightFor(mAppliedW);
     }
     // The width the window will keep. Taken from the view's OWN opening size rather than from a
     // constant here, so this file still knows nothing about pages: whatever the editor comes up
     // at is what the window is, and every later page change is height-only.
     mLockedW = mAppliedW;
     updateSizeHints();
+    placeStrip();
 }
 
 //------------------------------------------------------------------------
@@ -110,14 +176,17 @@ void EditorFrame::updateSizeHints()
         maxH = large.getHeight();
     }
 
+    // The strip rides along with the editor, so the WINDOW's limits are the editor's limits plus
+    // the strip at each of them. Leaving the editor-only numbers here would let the window manager
+    // offer a height with the bottom of the strip clipped off.
     XSizeHints hints = {};
     hints.flags = PMinSize;
     hints.min_width = minW;
-    hints.min_height = minH;
+    hints.min_height = minH + stripHeightFor(minW);
     if (maxW >= minW && maxH >= minH) {
         hints.flags |= PMaxSize;
         hints.max_width = maxW;
-        hints.max_height = maxH;
+        hints.max_height = maxH + stripHeightFor(maxW);
     }
     // A view that cannot be resized is pinned at the size it has, which is what a host would do
     // with canResize() == kResultFalse.
@@ -178,13 +247,17 @@ tresult PLUGIN_API EditorFrame::resizeView(IPlugView *view, ViewRect *newSize)
     // shared: the editor asked for 640x524 and got 748x524. Publishing the incoming page's
     // minimum before the request is what makes the request grantable.
     updateSizeHints();
-    applySize(w, h);
+    // `h` is the EDITOR's height; the window is that plus the strip. The editor asked for a page,
+    // not for a window, and the strip below it is not the editor's business.
+    mEditorH = h;
+    applySize(w, h + stripHeightFor(w));
 
     // The view is told what it GOT. Writing the granted width back into the caller's rect is not
     // optional: the editor reads this rect after the call returns, and leaving the width it asked
     // for in there would have it lay out for a window that does not exist.
     newSize->right = newSize->left + w;
     mView->onSize(newSize);
+    placeStrip();
     return kResultTrue;
 }
 
@@ -221,13 +294,69 @@ void EditorFrame::windowConfigured(int w, int h)
         return;
     }
 
+    // The strip comes off the bottom before the editor is told anything: what the window manager
+    // gave us is the WHOLE window, and the editor's share of it is the rest. A window too short to
+    // hold both leaves the editor at one pixel rather than at a negative height, and the strip is
+    // then simply not placed — the size hints above are what stops that being reachable, and this
+    // is what stops it being a crash if a window manager ignores them.
+    const int stripH = stripHeightFor(w);
+    const int editorH = h - stripH > 0 ? h - stripH : 1;
+
+    // WHAT THE EDITOR WILL ACTUALLY DRAW IN THAT SPACE, which is not always what it was offered.
+    // The pages differ, and the difference is the reason this is asked rather than assumed: the
+    // head page is aspect-locked and shrinks to fit whatever rectangle it is given, while the page
+    // that scrolls keeps the width and clamps the height to what it can use. Either way the
+    // leftover is unpainted window between the editor and the strip — a black band separating two
+    // things that have to look joined — so the window is corrected to the shape the editor fills.
+    //
+    // The two questions are asked in that order because only the first one's ANSWER says which page
+    // this is. A width that comes back unchanged means the height was acceptable and that is the
+    // size. A width that comes back smaller means the page is aspect-locked and the window is too
+    // short for the width the user chose — so it is asked again with an unbounded height, which
+    // gives the height that goes WITH that width. Deriving the height from the width, never the
+    // other way round, is what keeps a short wide drag from narrowing the window and taking the
+    // strip with it.
+    ViewRect fit(0, 0, w, editorH);
+    if (!constrainToFixedPoint(fit))
+        fit = ViewRect(0, 0, w, editorH);
+    else if (fit.getWidth() != w) {
+        ViewRect tall(0, 0, w, 1 << 15);
+        if (constrainToFixedPoint(tall))
+            fit = tall;
+    }
+    const int fitW = fit.getWidth() > 0 ? fit.getWidth() : w;
+    const int fitH = fit.getHeight() > 0 ? fit.getHeight() : editorH;
+    const int wantH = fitH + stripHeightFor(fitW);
+
     mAppliedW = w;
     mAppliedH = h;
-    mLockedW = w;
-    trace("configure: the window is now %dx%d", w, h);
+    mEditorH = fitH;
+    mLockedW = fitW;
+    trace("configure: the window is now %dx%d - editor %dx%d, strip %d tall", w, h, fitW, fitH,
+          stripHeightFor(fitW));
 
-    ViewRect actual(0, 0, w, h);
+    // THE CORRECTION IS ASKED FOR AT MOST ONCE PER TARGET, and that latch is the whole reason this
+    // is safe to do at all. A resize we requested arrives as more than one configure on a
+    // reparenting window manager, and an earlier version of this file re-requested on every
+    // mismatch: an intermediate step became a new request and the two sides argued forever.
+    // Measured that way — a page change back to the head page went out as 1133x403, an intermediate
+    // 748x460 came back, this function "corrected" it to 748x266, and the window stuck there.
+    // Asking once for a given target and then accepting whatever comes back is what makes the
+    // handshake terminate whatever the window manager does.
+    if (fitW == w && wantH == h) {
+        mRequestedW = -1;
+        mRequestedH = -1;
+    } else if (fitW != mRequestedW || wantH != mRequestedH) {
+        mRequestedW = fitW;
+        mRequestedH = wantH;
+        trace("configure: correcting %dx%d to %dx%d, which is the shape the editor fills", w, h,
+              fitW, wantH);
+        applySize(fitW, wantH);
+    }
+
+    ViewRect actual(0, 0, fitW, fitH);
     mView->onSize(&actual);
+    placeStrip();
 }
 
 } // namespace Rations
