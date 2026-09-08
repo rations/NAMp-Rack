@@ -27,6 +27,27 @@
 // finished with the snapshot, which is why no settling delay is needed — the parent project waits
 // two cycles precisely because it has no such handshake. A momentarily full queue is not an error:
 // the audio thread keeps the pointer and retries on the next block.
+//
+// WHAT THE SWAP IS MEASURED TO COST, AND WHAT IT IS NOT. The handshake above is silent, and that is
+// measured rather than argued: with a sine through the running amp at 128 frames, toggling a node's
+// enabled flag 758 times — 758 publishes, 758 adoptions, 758 retirements — left the largest
+// sample-to-sample step in the output at 0.005812, which is the figure for a chain that never
+// changed at all, to every digit. Zero dropouts, nothing non-finite.
+//
+// LOADING a plug-in into a running chain is a different thing and is NOT silent. The same churn
+// done by adding and removing the node instead took that step to 0.094341, a factor of sixteen, and
+// it did so with a plug-in whose output was byte-for-byte the same as no plug-in at all — so the
+// step is not the sound changing. It is that a freshly instantiated plug-in has empty delay lines
+// and cold filter state, and its first samples therefore do not continue the signal that was
+// already flowing. That is a property of inserting stateful DSP into live audio, not of this
+// handshake, and it is the same problem the amp's own priming and crossfade exist to solve for
+// models.
+//
+// FLAGGED, NOT FIXED. Closing it means running the outgoing and incoming chains together for a
+// fade — twice the CPU for the duration and every departing plug-in kept alive across it — which
+// is a design decision this engine has not taken and neither parent takes either. What is claimed
+// here is what has been measured: the snapshot swap is inaudible; loading a plug-in mid-signal is
+// not.
 
 #pragma once
 

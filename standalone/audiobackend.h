@@ -53,6 +53,11 @@ class IComponent;
 } // namespace Vst
 } // namespace Steinberg
 
+namespace NAMp::host
+{
+class ChainEngine;
+}
+
 namespace Rations
 {
 
@@ -79,6 +84,27 @@ public:
     virtual void close() = 0;
 
     virtual bool isOpen() const = 0;
+
+    // --- the rack ---------------------------------------------------------
+    // The chain of other people's plug-ins that runs either side of the amp. The engine is the
+    // audio-thread half of it and is owned above this interface, because the builder that publishes
+    // into it lives on the run loop; a backend only DRIVES it, bracketing its own call to the amp
+    // with the engine's beginBlock/beginChunk/endChunk.
+    //
+    // ON THE INTERFACE RATHER THAN ON ONE IMPLEMENTATION, because every backend has to do this and
+    // main.cpp only ever holds the interface. It is also the reason there is still no buffer
+    // pointer here: the samples reach the engine inside the callback, on the audio thread, and
+    // never cross this boundary.
+    //
+    // OPTIONAL, AND THE NULL CASE IS THE ONE THAT MUST STAY FREE. With no engine set, or with no
+    // chain published to one, the audio path must be exactly what it was before the rack existed —
+    // one branch per chunk and no copies. Set before open(), or with processing suspended.
+    virtual void setChainEngine(NAMp::host::ChainEngine *engine) = 0;
+
+    // Main thread: the chain's latency has changed, so whatever figure the audio system is
+    // reporting to the rest of the graph is stale. Cheap but not free, so it is called on a publish
+    // rather than every block. A backend with no notion of graph latency may do nothing.
+    virtual void notifyLatencyChanged() = 0;
 
     // The rate the device is actually running at, and the largest block it will deliver. Both are
     // the device's to decide, not ours — a backend reports what it was given rather than what it

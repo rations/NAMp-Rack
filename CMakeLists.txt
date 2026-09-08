@@ -875,6 +875,8 @@ if(NOT WIN32)
     # which does not carry them.
     add_executable(namp-rack
         ${NAMPRACK_ROOT}/standalone/main.cpp
+        # The host-side interface IIDs, exactly once per final binary — see hostiids.cpp.
+        ${NAMPRACK_ROOT}/src/host/hostiids.cpp
         ${NAMPRACK_ROOT}/standalone/audiobackend.h
         ${NAMPRACK_ROOT}/standalone/eventloop.h
         ${NAMPRACK_ROOT}/standalone/eventloop.cpp
@@ -895,6 +897,7 @@ if(NOT WIN32)
         PRIVATE
             NampRackPlugin
             NampRackResources
+            NampRackHost
             sdk_hosting
             PkgConfig::NAMPRACK_JACK
             ${NAMPRACK_PLATFORM_GUI_LIBS}

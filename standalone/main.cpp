@@ -23,6 +23,11 @@
 #include "editorframe.h"
 #include "eventloop.h"
 
+#include "host/catalog.h"
+#include "host/chainbuilder.h"
+#include "host/chainengine.h"
+#include "host/scanchild.h"
+
 #include "gfx/resourcestore.h"
 #include "rationsids.h"
 #include "version.h"
@@ -154,8 +159,10 @@ class BufferSizeWatcher : public Linux::ITimerHandler
 {
 public:
     BufferSizeWatcher(Rations::AudioBackend &audio, Vst::IComponent *component,
-                      Vst::IAudioProcessor *processor, const Vst::ProcessSetup &setup)
-        : mAudio(audio), mComponent(component), mProcessor(processor), mSetup(setup)
+                      Vst::IAudioProcessor *processor, const Vst::ProcessSetup &setup,
+                      NAMp::host::ChainEngine &engine, NAMp::host::ChainBuilder &builder)
+        : mAudio(audio), mEngine(engine), mBuilder(builder), mComponent(component),
+          mProcessor(processor), mSetup(setup)
     {
     }
 
@@ -187,9 +194,19 @@ public:
 
         mComponent->setActive(true);
         mProcessor->setProcessing(true);
+
+        // THE RACK IS RECONFIGURED INSIDE THE SAME SUSPENSION. Its scratch buses are sized for the
+        // old block and every hosted plug-in was told the old maximum; leaving either behind means
+        // the engine falls transparent the moment a larger block arrives — silently, because a
+        // transparent engine is exactly what an empty rack looks like.
+        //
         // Only adopt the new chunk size if the plug-in accepted it. If it did not, the old size is
         // still what it is prepared for, and the chunk loop must keep honouring that.
-        mAudio.resumeProcessing(ok ? size : mSetup.maxSamplesPerBlock);
+        const int adopted = ok ? size : mSetup.maxSamplesPerBlock;
+        mEngine.prepare(adopted);
+        mBuilder.configure(mSetup.sampleRate, adopted);
+        mAudio.resumeProcessing(adopted);
+        mAudio.notifyLatencyChanged();
 
         printf("namp-rack: the audio buffer size is now %d frames\n", mAudio.blockSize());
         fflush(stdout);
@@ -218,6 +235,8 @@ public:
 
 private:
     Rations::AudioBackend &mAudio;
+    NAMp::host::ChainEngine &mEngine;
+    NAMp::host::ChainBuilder &mBuilder;
     Vst::IComponent *mComponent = nullptr;
     Vst::IAudioProcessor *mProcessor = nullptr;
     Vst::ProcessSetup mSetup;
@@ -394,12 +413,231 @@ void saveState(Vst::IComponent *component)
 }
 
 //------------------------------------------------------------------------
+// Turn a --pre/--post argument into a catalogue entry. A full key is taken as it stands; anything
+// else is matched against display names, exactly first and then as a substring, both
+// case-insensitively.
+//
+// AN AMBIGUOUS SUBSTRING IS REPORTED RATHER THAN GUESSED AT. Silently loading the wrong plug-in is
+// worse than refusing to load one: the chain still makes sound, so nothing looks broken, and the
+// person is left wondering why their pedal does not sound like their pedal.
+bool resolvePlugin(const NAMp::host::Catalog &catalog, const std::string &spec,
+                   NAMp::host::PluginRef &out)
+{
+    for (const auto &entry : catalog.entries()) {
+        if (entry.ref.key == spec) {
+            out = entry.ref;
+            return true;
+        }
+    }
+
+    auto lower = [](std::string text) {
+        for (char &c : text)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return text;
+    };
+    const std::string needle = lower(spec);
+
+    const NAMp::host::PluginDesc *exact = nullptr;
+    std::vector<const NAMp::host::PluginDesc *> partial;
+    for (const auto &entry : catalog.entries()) {
+        const std::string name = lower(entry.name);
+        if (name == needle)
+            exact = &entry;
+        else if (name.find(needle) != std::string::npos)
+            partial.push_back(&entry);
+    }
+
+    if (exact) {
+        out = exact->ref;
+        return true;
+    }
+    if (partial.size() == 1) {
+        out = partial.front()->ref;
+        printf("namp-rack: '%s' -> %s\n", spec.c_str(), partial.front()->name.c_str());
+        return true;
+    }
+    if (partial.empty()) {
+        fprintf(stderr, "namp-rack: no scanned plug-in matches '%s'\n", spec.c_str());
+        return false;
+    }
+    fprintf(stderr, "namp-rack: '%s' is ambiguous:\n", spec.c_str());
+    for (const auto *entry : partial)
+        fprintf(stderr, "    %s\n", entry->name.c_str());
+    return false;
+}
+
+//------------------------------------------------------------------------
+// The builder's idle tick.
+//
+// The audio thread never frees anything: it pushes the chain snapshot it has stopped using into a
+// lock-free queue, and this is the thread that pops it and runs the only delete. Doing nothing here
+// leaks nothing permanently — it just leaves retired snapshots and departed plug-ins alive until
+// something does collect — but with audio running and a chain being edited it is what keeps that
+// bounded.
+class ChainCollector : public Linux::ITimerHandler
+{
+public:
+    explicit ChainCollector(NAMp::host::ChainBuilder &builder) : mBuilder(builder)
+    {
+    }
+
+    void PLUGIN_API onTimer() SMTG_OVERRIDE
+    {
+        mBuilder.collect();
+    }
+
+    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
+    {
+        if (!obj)
+            return kInvalidArgument;
+        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = static_cast<Linux::ITimerHandler *>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+
+private:
+    NAMp::host::ChainBuilder &mBuilder;
+};
+
+//------------------------------------------------------------------------
+// Add and remove a plug-in from the running chain, over and over, with audio going.
+//
+// THIS IS THE GATE ON THE THING THAT IS SAFE BY CONSTRUCTION RATHER THAN BY LUCK. Editing the rack
+// while the audio thread is inside it works because the chain is an immutable snapshot published by
+// atomic exchange, the audio thread never edits or frees one, and a departed plug-in is destroyed
+// only once a LATER snapshot is live. Every one of those is a claim about a race, and a claim about
+// a race is worth exactly what it has been measured at.
+//
+// So this churns as fast as the UI timer runs — publish, collect, publish — while the amp is
+// sounding, and the dropout count at the end is the answer. It runs on the run-loop thread, which
+// is where a rack edit comes from when a person does it, so the path under test is the real one.
+class RackStress : public Linux::ITimerHandler
+{
+public:
+    // `byEnable` toggles a node that stays loaded instead of adding and removing one. The two
+    // churn the SAME publish/adopt/retire handshake, and differ in exactly one thing: whether the
+    // plug-in the audio thread starts running has any internal state in it yet. That is what makes
+    // the pair able to tell a click in the mechanism from a click in the plug-in.
+    RackStress(NAMp::host::ChainBuilder &builder, Rations::AudioBackend &audio,
+               Rations::EventLoop &loop, const NAMp::host::PluginRef &ref, double seconds,
+               bool byEnable)
+        : mBuilder(builder), mAudio(audio), mLoop(loop), mRef(ref), mSeconds(seconds),
+          mByEnable(byEnable)
+    {
+    }
+
+    void PLUGIN_API onTimer() SMTG_OVERRIDE
+    {
+        if (mStart == Clock::time_point{})
+            mStart = Clock::now();
+
+        const double elapsed = std::chrono::duration<double>(Clock::now() - mStart).count();
+        if (elapsed >= mSeconds) {
+            // Names the mode it actually ran. The two churn very differently — one reloads the
+            // plug-in every cycle and one does not — and a line that reported them the same way
+            // would make two measurements look like one repeated.
+            printf("namp-rack: %d %s cycles in %.1f s, %u dropout%s at %d frames\n", mCycles,
+                   mByEnable ? "enable/disable" : "add/remove", elapsed, mAudio.dropouts(),
+                   mAudio.dropouts() == 1 ? "" : "s", mAudio.blockSize());
+            fflush(stdout);
+            mLoop.stop();
+            return;
+        }
+
+        // Alternate: one tick adds, the next removes. Both publish, so the audio thread adopts a
+        // new snapshot every tick and hands the previous one back — which is the handshake being
+        // exercised.
+        if (mByEnable) {
+            // The instance was loaded once, at startup, and stays loaded. Only its enabled flag
+            // moves, so every snapshot the audio thread adopts holds a plug-in that has been
+            // running and has its history.
+            mPresent = !mPresent;
+            mBuilder.setEnabled(NAMp::host::ChainSection::Post, 0, mPresent);
+        } else if (mPresent) {
+            mBuilder.remove(NAMp::host::ChainSection::Post, 0);
+            mPresent = false;
+        } else {
+            std::string error;
+            if (mBuilder.add(NAMp::host::ChainSection::Post, mRef, error) < 0) {
+                fprintf(stderr, "namp-rack: rack-stress could not add the plug-in: %s\n",
+                        error.c_str());
+                mLoop.stop();
+                return;
+            }
+            mPresent = true;
+        }
+        mBuilder.publish();
+        mAudio.notifyLatencyChanged();
+        ++mCycles;
+    }
+
+    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
+    {
+        if (!obj)
+            return kInvalidArgument;
+        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = static_cast<Linux::ITimerHandler *>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+
+    NAMp::host::ChainBuilder &mBuilder;
+    Rations::AudioBackend &mAudio;
+    Rations::EventLoop &mLoop;
+    NAMp::host::PluginRef mRef;
+    double mSeconds = 0.0;
+    Clock::time_point mStart{};
+    int mCycles = 0;
+    bool mPresent = false;
+    bool mByEnable = false;
+};
+
+//------------------------------------------------------------------------
 struct Options {
     // An external .vst3 to host INSTEAD of the amp linked in. Empty is the normal case. It exists
     // so a build of the amp made somewhere else can be driven by this rig without reinstalling
     // anything, which is how a bug that only appears in the bundle gets reproduced.
     std::string bundle;
     bool useState = true;
+    // Plug-ins to put in the rack before and after the amp, in the order given. Named rather than
+    // keyed: a display name is what a person has, and resolvePlugin() refuses an ambiguous one
+    // instead of guessing. There is no rack interface yet, so this is how a chain is built.
+    std::vector<std::string> pre;
+    std::vector<std::string> post;
+    // List what the scan found and exit. The same catalogue --pre/--post resolve against, so the
+    // two can never disagree about what is installed.
+    bool listPlugins = false;
+    // Seconds to spend adding and removing a plug-in from the chain with audio running, then
+    // report and exit. Zero is off. Needs one --post to know what to churn.
+    double rackStressSeconds = 0.0;
+    // Churn by toggling the node's enabled flag rather than by loading and unloading it.
+    bool rackStressByEnable = false;
 };
 
 void printUsage()
@@ -415,6 +653,14 @@ void printUsage()
            "  be installed. Naming a bundle hosts THAT plug-in instead, which is for driving a\n"
            "  build made elsewhere.\n"
            "\n"
+           "  --pre NAME    put a scanned plug-in in front of the amp; repeatable, and the\n"
+           "                order given is the order they run in\n"
+           "  --post NAME   the same, after the amp\n"
+           "  --list        list every plug-in the scan found, and exit\n"
+           "  --rack-stress S  add and remove the first --post plug-in for S seconds with audio\n"
+           "                running, then report the dropout count and exit\n"
+           "  --rack-stress-enable  as above, but toggle the node's enabled flag instead, so the\n"
+           "                plug-in stays loaded and keeps its internal state\n"
            "  --no-state    do not read or write %s\n"
            "  -h, --help    this message\n"
            "\n"
@@ -441,6 +687,30 @@ ArgResult parseArgs(int argc, char **argv, Options &opt)
             opt.useState = false;
             continue;
         }
+        if (arg == "--list") {
+            opt.listPlugins = true;
+            continue;
+        }
+        if (arg == "--rack-stress-enable") {
+            opt.rackStressByEnable = true;
+            continue;
+        }
+        if (arg == "--rack-stress") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "namp-rack: --rack-stress needs a number of seconds\n");
+                return ArgResult::Error;
+            }
+            opt.rackStressSeconds = std::atof(argv[++i]);
+            continue;
+        }
+        if (arg == "--pre" || arg == "--post") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "namp-rack: %s needs a plug-in name\n", arg.c_str());
+                return ArgResult::Error;
+            }
+            (arg == "--pre" ? opt.pre : opt.post).emplace_back(argv[++i]);
+            continue;
+        }
         if (!arg.empty() && arg[0] == '-') {
             fprintf(stderr, "namp-rack: unknown option %s\n", arg.c_str());
             printUsage();
@@ -461,6 +731,13 @@ int main(int argc, char **argv)
     // named on the command line and the resource-directory override both keep working.
     Rations::installBuiltinResources();
 
+    // This binary is its own scan helper, so a bundle is probed by a re-exec of it in a process
+    // whose only job is to be expendable. Before anything else, because the child must do nothing
+    // but the probe: no window, no audio, no state file.
+    int scanExit = 0;
+    if (NAMp::host::runScanChildIfRequested(argc, argv, scanExit))
+        return scanExit;
+
     Options opt;
     switch (parseArgs(argc, argv, opt)) {
         case ArgResult::Exit:
@@ -469,6 +746,18 @@ int main(int argc, char **argv)
             return 2;
         case ArgResult::Run:
             break;
+    }
+
+    // Answered before the amp, the audio device or the window exist, because it needs none of them
+    // and a scan that had to open a JACK connection first would be a scan nobody could run.
+    if (opt.listPlugins) {
+        NAMp::host::Catalog catalog;
+        catalog.rescan();
+        for (const auto &entry : catalog.entries())
+            printf("%-5s %-40s %s\n", NAMp::host::formatTag(entry.ref.format), entry.name.c_str(),
+                   entry.ref.key.c_str());
+        printf("\n%zu plug-in(s)\n", catalog.entries().size());
+        return 0;
     }
 
     // Say which plug-in this is, always. It is one line, and it is the line that distinguishes
@@ -586,6 +875,52 @@ int main(int argc, char **argv)
     ComponentHandler handler(audio);
     controller->setComponentHandler(&handler);
 
+    // --- the rack ----------------------------------------------------
+    // Built BEFORE the audio device is opened, so the first process callback already sees the whole
+    // chain. Publishing against a running audio thread is safe by construction and is what every
+    // later edit does — but doing it just to get started would mean the first block ran a chain
+    // that was still being assembled.
+    NAMp::host::ChainEngine chainEngine;
+    NAMp::host::ChainBuilder chainBuilder;
+    // The first --post plug-in, kept for --rack-stress. Resolving it again there would mean a
+    // second catalogue scan for a reference this loop already has.
+    NAMp::host::PluginRef stressRef;
+    chainEngine.prepare(blockSize);
+    chainBuilder.setEngine(&chainEngine);
+    chainBuilder.configure(sampleRate, blockSize);
+
+    if (!opt.pre.empty() || !opt.post.empty()) {
+        NAMp::host::Catalog catalog;
+        catalog.rescan();
+
+        const struct {
+            const std::vector<std::string> &specs;
+            NAMp::host::ChainSection section;
+            const char *label;
+        } sections[] = {{opt.pre, NAMp::host::ChainSection::Pre, "before"},
+                        {opt.post, NAMp::host::ChainSection::Post, "after"}};
+
+        for (const auto &group : sections) {
+            for (const auto &spec : group.specs) {
+                NAMp::host::PluginRef ref;
+                if (!resolvePlugin(catalog, spec, ref))
+                    continue;
+                std::string loadError;
+                if (chainBuilder.add(group.section, ref, loadError) < 0) {
+                    // One plug-in failing to load is not a reason to refuse to make sound.
+                    fprintf(stderr, "namp-rack: %s: %s\n", spec.c_str(), loadError.c_str());
+                    continue;
+                }
+                if (group.section == NAMp::host::ChainSection::Post && !stressRef.valid())
+                    stressRef = ref;
+                printf("namp-rack: %s the amp, %s\n", group.label, spec.c_str());
+            }
+        }
+        chainBuilder.publish();
+    }
+
+    audio.setChainEngine(&chainEngine);
+
     if (probe && !audio.open("NAMp-Rack", processor, component, &route))
         fprintf(stderr, "namp-rack: continuing without audio\n");
 
@@ -658,7 +993,24 @@ int main(int argc, char **argv)
     FeedbackPump feedback(audio, controller);
     eventLoop.registerTimer(&feedback, kUiTickMs);
 
-    BufferSizeWatcher blockWatcher(audio, component, processor, setup);
+    ChainCollector collector(chainBuilder);
+    eventLoop.registerTimer(&collector, kUiTickMs);
+
+    RackStress rackStress(chainBuilder, audio, eventLoop, stressRef, opt.rackStressSeconds,
+                          opt.rackStressByEnable);
+    if (opt.rackStressSeconds > 0.0) {
+        if (!stressRef.valid()) {
+            fprintf(stderr, "namp-rack: --rack-stress needs a --post plug-in to churn\n");
+            return 2;
+        }
+        if (!audio.isOpen()) {
+            fprintf(stderr, "namp-rack: --rack-stress needs audio; there is no JACK server\n");
+            return 2;
+        }
+        eventLoop.registerTimer(&rackStress, kUiTickMs);
+    }
+
+    BufferSizeWatcher blockWatcher(audio, component, processor, setup, chainEngine, chainBuilder);
     if (audio.isOpen())
         eventLoop.registerTimer(&blockWatcher, kUiTickMs);
 
@@ -686,6 +1038,9 @@ int main(int argc, char **argv)
     // --- teardown ----------------------------------------------------
     if (audio.isOpen())
         eventLoop.unregisterTimer(&blockWatcher);
+    if (opt.rackStressSeconds > 0.0)
+        eventLoop.unregisterTimer(&rackStress);
+    eventLoop.unregisterTimer(&collector);
     eventLoop.unregisterTimer(&feedback);
     if (view) {
         view->removed();
@@ -701,6 +1056,13 @@ int main(int argc, char **argv)
     }
 
     audio.close();
+    // The audio thread is gone, so nothing can still be holding a snapshot: collectAll frees
+    // everything outstanding whether or not the engine handed it back, which collect() alone
+    // cannot do because it has no way to know the thread has stopped.
+    audio.setChainEngine(nullptr);
+    chainEngine.abandon();
+    chainBuilder.collectAll();
+
     processor->setProcessing(false);
     component->setActive(false);
     // With the audio thread gone and the component inactive, so nothing is moving underneath the

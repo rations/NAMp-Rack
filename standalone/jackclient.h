@@ -18,6 +18,8 @@
 #pragma once
 
 #include "audiobackend.h"
+
+#include "host/chainengine.h"
 #include "midiroute.h"
 
 #include "public.sdk/source/vst/hosting/eventlist.h"
@@ -45,6 +47,13 @@ public:
     bool open(const char *clientName, Steinberg::Vst::IAudioProcessor *processor,
               Steinberg::Vst::IComponent *component, const MidiRoute *route) override;
     void close() override;
+
+    // --- the rack --------------------------------------------------------
+    void setChainEngine(NAMp::host::ChainEngine *engine) override
+    {
+        mChain = engine;
+    }
+    void notifyLatencyChanged() override;
 
     bool isOpen() const override
     {
@@ -77,7 +86,9 @@ private:
     static int processTrampoline(jack_nframes_t nframes, void *arg);
     static int bufferSizeTrampoline(jack_nframes_t nframes, void *arg);
     static int xrunTrampoline(void *arg);
+    static void latencyTrampoline(jack_latency_callback_mode_t mode, void *arg);
     int process(jack_nframes_t nframes);
+    void reportLatency(jack_latency_callback_mode_t mode);
     void drainParameterRing();            // RT thread
     void readMidi(jack_nframes_t frames); // RT thread
     void publishFeedback();               // RT thread
@@ -111,6 +122,15 @@ private:
 
     // Bumped from JACK's own notification thread, read from anywhere. See dropouts().
     std::atomic<uint32_t> mXruns{0};
+
+    // The rack. Null until setChainEngine(), and null is the transparent path: one branch per
+    // chunk, no copies, and exactly the audio path this standalone had before the rack existed.
+    NAMp::host::ChainEngine *mChain = nullptr;
+
+    // The amp's own reported latency, read once at open() while the processor is quiescent. The
+    // chain's is added to it in reportLatency() and comes from the engine, so it is the latency of
+    // the chain actually running rather than of one that has been queued.
+    uint32_t mPluginLatency = 0;
 
     jack_client_t *mClient = nullptr;
     jack_port_t *mInPort = nullptr;

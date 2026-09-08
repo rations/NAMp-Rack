@@ -3,6 +3,8 @@
 
 #include "jackclient.h"
 
+#include "host/hostapp.h"
+
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivstevents.h"
 
@@ -73,6 +75,9 @@ bool JackClient::open(const char *clientName, Vst::IAudioProcessor *processor,
     mProcessor = processor;
     mComponent = component;
     mRoute = route;
+    // Read once, here, while the processor is set up and not yet running. Asking for it from the
+    // latency callback would be a VST3 call from JACK's own thread.
+    mPluginLatency = processor->getLatencySamples();
 
     jack_status_t status = static_cast<jack_status_t>(0);
     mClient = jack_client_open(clientName, JackNoStartServer, &status);
@@ -133,6 +138,14 @@ bool JackClient::open(const char *clientName, Vst::IAudioProcessor *processor,
     // Not fatal: the xrun count is diagnostic, and losing it is no reason to refuse to play. It
     // does mean the live gate would read zero for the wrong reason, which is why the failure is
     // said out loud rather than swallowed.
+    // Without this JACK reports zero latency for this client no matter what the amp or the rack
+    // add, and every other client in the graph compensates against a number that is wrong. Not
+    // fatal — the audio is unaffected, only the figure — so it warns and carries on.
+    if (jack_set_latency_callback(mClient, latencyTrampoline, this) != 0)
+        fprintf(stderr,
+                "namp-rack: cannot install the JACK latency callback - this client will report "
+                "zero latency to the graph\n");
+
     if (jack_set_xrun_callback(mClient, xrunTrampoline, this) != 0)
         fprintf(stderr, "namp-rack: cannot install the JACK xrun callback - xruns will read 0\n");
 
@@ -416,9 +429,66 @@ void JackClient::resumeProcessing(int blockSize)
 }
 
 //------------------------------------------------------------------------
+void JackClient::latencyTrampoline(jack_latency_callback_mode_t mode, void *arg)
+{
+    static_cast<JackClient *>(arg)->reportLatency(mode);
+}
+
+//------------------------------------------------------------------------
+// JACK's latency callback. Called from JACK's own thread when the graph is recomputed, which is
+// why nothing here asks the plug-in anything: mPluginLatency was read at open().
+void JackClient::reportLatency(jack_latency_callback_mode_t mode)
+{
+    if (!mInPort || !mOutPorts[0] || !mOutPorts[1])
+        return;
+
+    // The rack's own nodes add to it. The chain is serial, so this is a plain sum and no
+    // compensation delay is needed anywhere; what matters is that the figure is not silently zero,
+    // which is what a host that never implements this reports for every plug-in it hosts.
+    const uint32_t latency = mPluginLatency + (mChain ? mChain->latencySamples() : 0);
+
+    jack_latency_range_t range = {};
+    if (mode == JackCaptureLatency) {
+        jack_port_get_latency_range(mInPort, JackCaptureLatency, &range);
+        range.min += latency;
+        range.max += latency;
+        for (jack_port_t *port : mOutPorts)
+            jack_port_set_latency_range(port, JackCaptureLatency, &range);
+        return;
+    }
+
+    jack_latency_range_t merged = {UINT32_MAX, 0};
+    for (jack_port_t *port : mOutPorts) {
+        jack_port_get_latency_range(port, JackPlaybackLatency, &range);
+        merged.min = std::min(merged.min, range.min);
+        merged.max = std::max(merged.max, range.max);
+    }
+    if (merged.min == UINT32_MAX)
+        merged.min = 0;
+    merged.min += latency;
+    merged.max += latency;
+    jack_port_set_latency_range(mInPort, JackPlaybackLatency, &merged);
+}
+
+//------------------------------------------------------------------------
+void JackClient::notifyLatencyChanged()
+{
+    if (mClient)
+        jack_recompute_total_latencies(mClient);
+}
+
+//------------------------------------------------------------------------
 // JACK real-time thread. Nothing here allocates, locks, or logs.
 int JackClient::process(jack_nframes_t nframes)
 {
+    // Raised for the whole callback, not per node. It is what lets the host layer's allocation
+    // counter tell a legitimate allocation during a load from one made while audio is running, and
+    // it covers the AMP's process() as well as the hosted chain's — the counter is a property of
+    // the thread, and this is the thread. Without it the counter is real, wired up and permanently
+    // zero, which is the worst kind of diagnostic: one that always says everything is fine.
+    // Cost when nothing is armed: one thread-local increment and one decrement per JACK cycle.
+    const NAMp::host::RtScope rtScope;
+
     float *outL = static_cast<float *>(jack_port_get_buffer(mOutPorts[0], nframes));
     float *outR = static_cast<float *>(jack_port_get_buffer(mOutPorts[1], nframes));
     if (!outL || !outR)
@@ -447,6 +517,11 @@ int JackClient::process(jack_nframes_t nframes)
     readMidi(nframes);
     mProcessData.inputEvents = &mEvents;
 
+    // Once per JACK cycle, never per chunk: adopting a chain mid-block would run the first chunk
+    // with one topology and the rest with another.
+    if (mChain)
+        mChain->beginBlock();
+
     // Loop, never clamp. JACK's buffer size can change under a running client, and the processor
     // was set up for mBlockSize: handing it more would break that contract, and truncating to
     // mBlockSize would leave the rest of the block holding whatever JACK's buffer had in it from
@@ -457,16 +532,32 @@ int JackClient::process(jack_nframes_t nframes)
     while (done < nframes) {
         const int32 n = static_cast<int32>(std::min<jack_nframes_t>(chunk, nframes - done));
 
-        // Point the VST3 bus buffers straight at JACK's, so no copy is needed.
+        // The rack runs the nodes in front of the amp and reports where the amp should read and
+        // write. With no rack loaded these are JACK's own pointers, which is the no-copy path this
+        // standalone has always taken — one branch, and nothing else changes.
+        NAMp::host::ChainIo io;
+        if (mChain) {
+            mChain->beginChunk(in + done, outL + done, outR + done, n, io);
+        } else {
+            io.anchorIn = in + done;
+            io.anchorOut[0] = outL + done;
+            io.anchorOut[1] = outR + done;
+        }
+
+        // Point the VST3 bus buffers straight at the chain's, so no copy is needed.
         if (mProcessData.inputs && mProcessData.inputs[0].numChannels > 0)
-            mProcessData.inputs[0].channelBuffers32[0] = in + done;
+            mProcessData.inputs[0].channelBuffers32[0] = const_cast<float *>(io.anchorIn);
         if (mProcessData.outputs && mProcessData.outputs[0].numChannels > 1) {
-            mProcessData.outputs[0].channelBuffers32[0] = outL + done;
-            mProcessData.outputs[0].channelBuffers32[1] = outR + done;
+            mProcessData.outputs[0].channelBuffers32[0] = io.anchorOut[0];
+            mProcessData.outputs[0].channelBuffers32[1] = io.anchorOut[1];
         }
         mProcessData.numSamples = n;
 
         mProcessor->process(mProcessData);
+
+        // The nodes after the amp, then the end-of-chain safety pass over JACK's own outputs.
+        if (mChain)
+            mChain->endChunk();
 
         publishFeedback();
         // The queued edits and the MIDI belong to the top of the JACK block, not to every chunk of
