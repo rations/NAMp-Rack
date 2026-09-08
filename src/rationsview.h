@@ -346,6 +346,15 @@ private:
     float mDragStartX = 0;
     float mMouseX = 0, mMouseY = 0;
 
+    // The coordinate frame the press that is being held was hit-tested in. The setup page hands
+    // each of its two columns the column's own x and its own scroll, so a drag has to be measured
+    // in the frame it STARTED in: re-deriving the column from where the pointer is now would move
+    // the origin out from under a slider the moment the drag crossed the column's edge, and throw
+    // the value by the width of a column. Latched at the press, in onMouseDown, which is the one
+    // place that undoes the page transform.
+    float mFrameX = 0;
+    bool mFrameCabinet = false;
+
     // Meter display state: fast attack from ParamChanged, exponential release in onTick, plus a
     // peak marker that holds and then falls.
     float mInDisp = 0, mOutDisp = 0;

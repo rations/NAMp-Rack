@@ -24,6 +24,21 @@
 //      the ring into the input queues at the top of process(). The controller is never touched from
 //      the audio thread and the plug-in's processing state is never touched from the UI thread.
 //
+//   5. THE PLUG-IN'S OWN EDITOR NEEDS A WAY BACK, AND IT IS THE ONE THE HOST MUST SUPPLY. A knob
+//      turned in a plug-in's own window reaches its processor by exactly one route: the editor
+//      calls IEditController::performEdit, the SDK's EditController forwards that to whatever
+//      IComponentHandler the host installed, and the host writes the value into the next block's
+//      input parameter changes. PlugProvider builds and connects the component/controller pair but
+//      installs NO handler, and with none of our own the SDK's forward is
+//
+//          if (componentHandler) return componentHandler->performEdit (tag, value);
+//          return kResultFalse;
+//
+//      — a dead end returning a failure nobody checks. The plug-in loads, its editor opens and
+//      draws, its controls move, and its audio never changes. Measured on the pedals shipped beside
+//      this host: a Boost with its footswitch stomped in its own window passed its input through
+//      bit-identical, and the same pedal engaged through paramSetFromUi() clipped as it should.
+//
 // Channel adaptation: when the plug-in's negotiated channel count matches the chain's, the fast
 // path applies and nothing is copied. When it does not — a stereo-only plug-in placed in the mono
 // pre-amp section — the node falls back to internal scratch buffers with copies at both ends. That
@@ -160,6 +175,47 @@ public:
 private:
     Vst3Backend() = default;
 
+    //--------------------------------------------------------------------
+    // The way back from the plug-in's own editor. Every call arrives on the UI thread, which is
+    // the thread paramSetFromUi() is already the entry point for, so an edit made in a plug-in's
+    // window and one made in the generic panel take the identical route into the chain: enqueue,
+    // and nothing else.
+    //
+    // Not reference counted. It is a member of the backend and dies with it, and a plug-in that
+    // released it once too often would otherwise take the backend with it — which is the same
+    // reason the SDK's own hosting sample pins its handler's count.
+    class EditHandler final : public Steinberg::Vst::IComponentHandler
+    {
+    public:
+        explicit EditHandler(Vst3Backend &owner) : mOwner(owner)
+        {
+        }
+
+        Steinberg::tresult PLUGIN_API beginEdit(Steinberg::Vst::ParamID id) override;
+        Steinberg::tresult PLUGIN_API performEdit(Steinberg::Vst::ParamID id,
+                                                  Steinberg::Vst::ParamValue value) override;
+        Steinberg::tresult PLUGIN_API endEdit(Steinberg::Vst::ParamID id) override;
+        Steinberg::tresult PLUGIN_API restartComponent(Steinberg::int32 flags) override;
+
+        Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID iid,
+                                                     void **obj) override;
+        Steinberg::uint32 PLUGIN_API addRef() override
+        {
+            return 1000;
+        }
+        Steinberg::uint32 PLUGIN_API release() override
+        {
+            return 1000;
+        }
+
+    private:
+        Vst3Backend &mOwner;
+    };
+
+    // Index of the parameter carrying `id`, or mParams.size() if the plug-in named one it never
+    // published. A plug-in is entitled to do that and it must not be a crash.
+    size_t indexOfParamId(Steinberg::Vst::ParamID id) const;
+
     void teardown();
     // Turn on every audio bus the plug-in marks default-active. Without this most plug-ins are
     // silent.
@@ -214,6 +270,11 @@ private:
         char units[32] = {};
     };
     std::vector<Param> mParams;
+
+    // Installed on the controller as soon as there is a controller, so an editor opened at any
+    // point afterwards has somewhere to send its edits. Cleared in teardown() before the
+    // controller is dropped.
+    EditHandler mEditHandler{*this};
 
     //--- editor ---------------------------------------------------------
     std::atomic<bool> mResizePending{false};

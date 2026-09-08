@@ -178,6 +178,20 @@ Vst3Backend *Vst3Backend::load(const PluginRef &ref, std::string &error)
 
     self->mComponent = self->mProvider->getComponentPtr();
     self->mController = self->mProvider->getControllerPtr();
+
+    // PlugProvider connects the component/controller pair but installs no component handler, and
+    // without one IEditController::performEdit returns kResultFalse and the edit is gone. See
+    // decision 5 at the top of the header: this is what makes a plug-in's own editor able to
+    // change its own sound.
+    // A controller that refuses the handler is not fatal — its audio still works and the generic
+    // panel still drives it — but its own editor will be a decoration, so say which plug-in it was
+    // rather than leaving the user to wonder why one window in the rack does nothing.
+    if (self->mController &&
+        self->mController->setComponentHandler(&self->mEditHandler) != kResultOk)
+        std::fprintf(stderr,
+                     "[NAMp-Rack] %s refused the component handler: edits made in its own "
+                     "editor will not reach its audio\n",
+                     self->mName.c_str());
     if (!self->mComponent) {
         error = "no IComponent for " + self->mName;
         delete self;
@@ -548,6 +562,78 @@ double Vst3Backend::paramGet(uint32_t index) const
     if (index >= mParams.size() || !mController)
         return 0.0;
     return mController->getParamNormalized(mParams[index].id);
+}
+
+//------------------------------------------------------------------------
+size_t Vst3Backend::indexOfParamId(Vst::ParamID id) const
+{
+    for (size_t i = 0; i < mParams.size(); ++i)
+        if (mParams[i].id == id)
+            return i;
+    return mParams.size();
+}
+
+//------------------------------------------------------------------------
+tresult PLUGIN_API Vst3Backend::EditHandler::queryInterface(const TUID iid, void **obj)
+{
+    if (!obj)
+        return kInvalidArgument;
+    if (FUnknownPrivate::iidEqual(iid, Vst::IComponentHandler::iid) ||
+        FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+        *obj = static_cast<Vst::IComponentHandler *>(this);
+        addRef();
+        return kResultTrue;
+    }
+    *obj = nullptr;
+    return kNoInterface;
+}
+
+//------------------------------------------------------------------------
+// beginEdit / endEdit bracket a gesture so a host can group it into one automation event. This host
+// records no automation, so there is nothing to open and nothing to close, and kNotImplemented is
+// the honest answer rather than a kResultOk claiming work that was not done.
+tresult PLUGIN_API Vst3Backend::EditHandler::beginEdit(Vst::ParamID)
+{
+    return kNotImplemented;
+}
+
+tresult PLUGIN_API Vst3Backend::EditHandler::endEdit(Vst::ParamID)
+{
+    return kNotImplemented;
+}
+
+//------------------------------------------------------------------------
+// The edit itself, on the UI thread. Straight into paramSetFromUi(), which is the only entry point
+// that touches the transfer ring, so an edit from a plug-in's own window is indistinguishable
+// downstream from one made in the generic panel — including in never touching the plug-in's live
+// processing state from this thread.
+//
+// An edit arriving before prepare() has enumerated the parameters has nowhere to go: mParams is
+// empty and the ring has no capacity yet. It is not lost, because the plug-in's controller holds
+// the value and prepare() reads the controller.
+tresult PLUGIN_API Vst3Backend::EditHandler::performEdit(Vst::ParamID id, Vst::ParamValue value)
+{
+    const size_t index = mOwner.indexOfParamId(id);
+    if (index >= mOwner.mParams.size())
+        return kResultFalse;
+    mOwner.paramSetFromUi(static_cast<uint32_t>(index), value);
+    return kResultTrue;
+}
+
+//------------------------------------------------------------------------
+// A plug-in asking to be restarted. kParamValuesChanged needs nothing from us: paramGet() reads the
+// controller live, so the panel and the next preset save already see the new values.
+//
+// TODO: kLatencyChanged is acknowledged and not yet acted on. Honouring it means recompiling the
+// chain to re-balance delay compensation, and the backend interface has no way to ask for that;
+// adding one is a chain-builder change and belongs with that work rather than being smuggled in
+// here. Until then a plug-in that changes its latency while loaded stays compensated at the latency
+// it reported when the chain was built.
+tresult PLUGIN_API Vst3Backend::EditHandler::restartComponent(int32 flags)
+{
+    if (flags & Vst::kParamValuesChanged)
+        return kResultTrue;
+    return kNotImplemented;
 }
 
 //------------------------------------------------------------------------

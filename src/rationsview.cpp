@@ -1831,6 +1831,9 @@ void RationsEditorView::onMouseDown(int x, int y, int button)
         return;
     mMouseX = fx;
     mMouseY = fy;
+    // Window coordinates until a column claims the press below.
+    mFrameX = 0;
+    mFrameCabinet = false;
 
     // The Slim overlay captures input while open: its knob, or anywhere else to dismiss. Tested
     // before the browser because it is drawn over it, and it returns unconditionally, so nothing
@@ -1883,12 +1886,16 @@ void RationsEditorView::onMouseDown(int x, int y, int button)
             if (fy < static_cast<float>(geo::kPageContentTop))
                 return;
             // Then the column, and each handler is given its own x — the same offset the painter
-            // added, subtracted again. Neither handler knows it shares a page.
-            if (geo::inSetupSettingsColumn(fx))
-                handleSettingsClick(fx - static_cast<float>(geo::kSetupSetColX), contentY(fy));
-            else
-                handleCabinetClick(fx - static_cast<float>(geo::kSetupCabColX),
-                                   columnContentY(fx, fy));
+            // added, subtracted again. Neither handler knows it shares a page. The offset is also
+            // latched, because a drag started in here is measured against it for its whole life.
+            if (geo::inSetupSettingsColumn(fx)) {
+                mFrameX = static_cast<float>(geo::kSetupSetColX);
+                handleSettingsClick(fx - mFrameX, contentY(fy));
+            } else {
+                mFrameX = static_cast<float>(geo::kSetupCabColX);
+                mFrameCabinet = true;
+                handleCabinetClick(fx - mFrameX, columnContentY(fx, fy));
+            }
             return;
     }
 }
@@ -2019,10 +2026,16 @@ bool RationsEditorView::handleIrRowClick(int slot, float x, float y)
 //------------------------------------------------------------------------
 void RationsEditorView::onMouseMove(int x, int y)
 {
-    mMouseX = static_cast<float>((x - mOffX) / mScale);
-    // In PAGE coordinates, like every rect it is tested against. A drag reads deltas, and those
-    // are the same either way, but the hover tests are not.
-    mMouseY = columnContentY(mMouseX, static_cast<float>((y - mOffY) / mScale));
+    const float fx = static_cast<float>((x - mOffX) / mScale);
+    const float fy = static_cast<float>((y - mOffY) / mScale);
+    // In the frame the press was hit-tested in, which on the setup page is a COLUMN's and not the
+    // window's. A drag reads deltas and both ends have to be measured the same way: the start came
+    // from the handler that owns the column, so the end must come from that column too. Getting
+    // this wrong is not a small error — the settings column starts 567 units in and a level
+    // slider's whole travel is geo::kLevelDragRange, which is 274, so the very first mouse move
+    // asks for twice the full range and the slider slams to +12 dB with no middle to it.
+    mMouseX = fx - mFrameX;
+    mMouseY = mFrameCabinet ? fy + static_cast<float>(cabinetScroll()) : contentY(fy);
 
     if (mScrollDrag) {
         // The thumb's travel is the track minus the thumb, and the scroll's range is mScrollMax,
@@ -2031,7 +2044,7 @@ void RationsEditorView::onMouseMove(int x, int y)
         // it here is one fewer thing that can go stale.
         const Rect track = scrollTrackRect();
         const float travel = track.h - scrollThumbRect().h;
-        const float dy = static_cast<float>((y - mOffY) / mScale) - mScrollGrabY;
+        const float dy = fy - mScrollGrabY;
         setScroll(travel > 0.0f ? mScrollGrabScroll + dy * (mScrollMax / travel)
                                 : mScrollGrabScroll);
         return;
