@@ -233,12 +233,32 @@ private:
     double viewportH() const;
     // Clamp into [0, mScrollMax] and repaint if it moved. Returns whether it moved.
     bool setScroll(double y);
+    // How far the CABINET column has been scrolled, which is not how far the page has.
+    //
+    // THE CABINET STAYS IN VIEW. It is a picture with three controls on it and it is the shorter of
+    // the two columns by a wide margin — 304 units against the settings column's 928 — so scrolling
+    // the settings list should not take it off the top of the window. It is pinned.
+    //
+    // But it cannot be pinned unconditionally, and the arithmetic says why: the block sits at
+    // y 135 and ends at 439, while the window is allowed to be as short as kSettingsMinViewH, 190.
+    // Nailed down at that height, both IR loader rows would be below the bottom edge and there
+    // would be no gesture left that could reach them. So it is pinned only as far as it FITS: it
+    // scrolls with the page until its own bottom edge is on screen and then stops. At any window
+    // tall enough to show it — which is every window from the opening size up — that clamp is zero
+    // and the column never moves at all.
+    double cabinetScroll() const;
+
     // A page-content Y from a window Y. The one place the scroll is undone for input, mirroring
     // the one place it is applied for drawing.
     float contentY(float fy) const
     {
         return fy + static_cast<float>(mScrollY);
     }
+    // The same thing for a page whose columns do not scroll together: undoes the scroll of
+    // whichever column `fx` is in. Every hit test on the setup page goes through this rather than
+    // contentY, because a click in the cabinet column is measured against a column that has moved
+    // by a different amount — usually none.
+    float columnContentY(float fx, float fy) const;
     Rect scrollTrackRect() const;
     Rect scrollThumbRect() const;
     // Thumb grab, or a track click that pages towards the pointer. Returns whether it took the

@@ -241,6 +241,26 @@ void RationsEditorView::recomputeLayout()
 }
 
 //------------------------------------------------------------------------
+// See the note above the declaration: the cabinet column is pinned, but only as far as it fits.
+double RationsEditorView::cabinetScroll() const
+{
+    if (mPage != geo::Page::Setup)
+        return mScrollY;
+    // How far this column would have to move for its own bottom edge to be on screen. Negative at
+    // any window tall enough to show the whole block, which is where the clamp becomes "never".
+    const double needed = static_cast<double>(geo::kCabY + geo::kCabBlockH) - viewportH();
+    return std::min(mScrollY, std::max(0.0, needed));
+}
+
+//------------------------------------------------------------------------
+float RationsEditorView::columnContentY(float fx, float fy) const
+{
+    if (mPage == geo::Page::Setup && !geo::inSetupSettingsColumn(fx))
+        return fy + static_cast<float>(cabinetScroll());
+    return contentY(fy);
+}
+
+//------------------------------------------------------------------------
 // The visible height of the page, in logical units.
 double RationsEditorView::viewportH() const
 {
@@ -330,16 +350,9 @@ void RationsEditorView::drawStaticLayer(Canvas &c)
                          geo::kTitleBaselineY);
             break;
         case geo::Page::Setup:
-            // The cabinet art, in the LEFT column's own coordinates. The settings column has no
-            // static layer of its own — it is rows drawn live — so the whole of this page's
-            // static ink is one image, and the ground the caller already painted is the rest.
-            {
-                cairo_save(c.cr());
-                cairo_translate(c.cr(), geo::kSetupCabColX, 0.0);
-                if (cairo_surface_t *cab = mImages.get("cabinet"))
-                    c.drawImage(cab, Rect(geo::kCabX, geo::kCabY, geo::kCabW, geo::kCabH));
-                cairo_restore(c.cr());
-            }
+            // NOTHING. This page scrolls, and everything on it moves with the scroll — the cabinet
+            // art included, which is why it is drawn by composeCabinet() with the dial and the rows
+            // that sit on top of it. See the note there.
             break;
     }
 }
@@ -348,6 +361,12 @@ void RationsEditorView::rebuildBackground()
 {
     releaseBackground();
     if (!mResourcesLoaded || mDevW <= 0 || mDevH <= 0)
+        return;
+    // A PAGE WHOSE INK SCROLLS HAS NOTHING TO CACHE. The cache is a window-sized surface blitted
+    // before the scroll translate, so anything in it is pinned to the window — which is the whole
+    // point on the head page and a bug on a page that moves. Leaving it null is a normal state,
+    // not a failure: onDraw paints the ground inline and composes the page inside the translate.
+    if (geo::pageScrolls(mPage))
         return;
 
     cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, mDevW, mDevH);
@@ -394,8 +413,9 @@ void RationsEditorView::onDraw(cairo_t *cr)
         cairo_paint(cr);
         cairo_restore(cr);
     } else {
-        // Could not allocate the cached surface: paint the ground inline, still in device space so
-        // the margins are covered.
+        // No cached surface — either because this page's ink scrolls and there is nothing to cache
+        // (see rebuildBackground) or because the allocation failed. Either way the ground is
+        // painted inline, still in device space so the letterbox margins are covered.
         cairo_save(cr);
         cairo_set_source_rgb(cr, ((geo::kBgColor >> 16) & 0xFF) / 255.0,
                              ((geo::kBgColor >> 8) & 0xFF) / 255.0, (geo::kBgColor & 0xFF) / 255.0);
@@ -413,16 +433,18 @@ void RationsEditorView::onDraw(cairo_t *cr)
         drawStaticLayer(c);
 
     if (scrolling()) {
-        // The page content, moved up by the scroll and clipped to the band below the fixed
-        // header. The clip is what keeps a row that has scrolled past the top from drawing over
-        // the back button, and it is the same rect the scroll range is computed from.
+        // The page content, clipped to the band below the fixed header. The clip is what keeps a
+        // row that has scrolled past the top from drawing over the back button, and it is the same
+        // rect the scroll range is computed from.
+        //
+        // THE SCROLL ITSELF IS APPLIED BY compose(), NOT HERE, because on the setup page the two
+        // columns do not scroll by the same amount — the cabinet is pinned and the settings list is
+        // not. One translate around the whole page would have to be undone again for one of them,
+        // and that is the shape of bug where the painter and the hit test disagree.
         const float top = static_cast<float>(geo::kPageContentTop);
         c.pushClip(
             Rect(0.0f, top, static_cast<float>(ps.w), static_cast<float>(viewportH()) - top));
-        cairo_save(cr);
-        cairo_translate(cr, 0.0, -mScrollY);
         compose(c);
-        cairo_restore(cr);
         c.popClip();
     } else {
         compose(c);
@@ -447,13 +469,20 @@ void RationsEditorView::compose(Canvas &c)
             // the scroll already uses, and for the same reason: a second coordinate system would
             // have to be undone in the painter, the hit test and the art audit, and one of the
             // three would forget.
+            //
+            // AND THE TWO COLUMNS DO NOT SCROLL TOGETHER, which is the second thing each translate
+            // carries. The settings column is the list, 928 units of it, and it moves by the page's
+            // scroll. The cabinet column is a picture with three controls on it, 347 units tall,
+            // and it is PINNED — scrolling a list should not take the thing the list is not about
+            // off the top of the window. cabinetScroll() is the clamp that keeps that safe at a
+            // window too short to show even the cabinet; see its declaration.
             cairo_save(c.cr());
-            cairo_translate(c.cr(), geo::kSetupCabColX, 0.0);
+            cairo_translate(c.cr(), geo::kSetupCabColX, -cabinetScroll());
             composeCabinet(c);
             cairo_restore(c.cr());
 
             cairo_save(c.cr());
-            cairo_translate(c.cr(), geo::kSetupSetColX, 0.0);
+            cairo_translate(c.cr(), geo::kSetupSetColX, -mScrollY);
             composeSettings(c);
             cairo_restore(c.cr());
             break;
@@ -602,6 +631,23 @@ void RationsEditorView::composeHead(Canvas &c)
 //------------------------------------------------------------------------
 void RationsEditorView::composeCabinet(Canvas &c)
 {
+    // THE CABINET ART IS PAGE CONTENT, NOT A BACKGROUND, and drawing it here rather than in the
+    // static layer is what makes the Blend dial and the two IR rows stay on it.
+    //
+    // The static layer is cached into a surface the size of the WINDOW and blitted before the
+    // scroll translate is applied, which is exactly right for a page that cannot scroll: it is the
+    // faceplate, it never moves, and caching it is what keeps a knob drag from re-rasterising a
+    // photograph. This page scrolls, and a cache like that cannot: it is painted at scroll zero and
+    // holds nothing below the viewport. Measured, with the art still in the static layer — scrolled
+    // down six clicks, the cabinet stayed nailed to the top of the window while its own dial
+    // floated off above it and the IR rows slid down across the speaker grilles.
+    //
+    // So this column's ink is composed in one place, in the column's own coordinates, inside the
+    // one translate the scroll already uses. See rebuildBackground(), which caches nothing for a
+    // page whose static ink scrolls.
+    if (cairo_surface_t *cab = mImages.get("cabinet"))
+        c.drawImage(cab, Rect(geo::kCabX, geo::kCabY, geo::kCabW, geo::kCabH));
+
     const bool active = blendActive();
     drawKnobAt(c, static_cast<float>(geo::kBlendCX), static_cast<float>(geo::kBlendCY),
                static_cast<float>(geo::kBlendR), paramValue(kIrBlendId));
@@ -1841,7 +1887,8 @@ void RationsEditorView::onMouseDown(int x, int y, int button)
             if (geo::inSetupSettingsColumn(fx))
                 handleSettingsClick(fx - static_cast<float>(geo::kSetupSetColX), contentY(fy));
             else
-                handleCabinetClick(fx - static_cast<float>(geo::kSetupCabColX), contentY(fy));
+                handleCabinetClick(fx - static_cast<float>(geo::kSetupCabColX),
+                                   columnContentY(fx, fy));
             return;
     }
 }
@@ -1975,7 +2022,7 @@ void RationsEditorView::onMouseMove(int x, int y)
     mMouseX = static_cast<float>((x - mOffX) / mScale);
     // In PAGE coordinates, like every rect it is tested against. A drag reads deltas, and those
     // are the same either way, but the hover tests are not.
-    mMouseY = contentY(static_cast<float>((y - mOffY) / mScale));
+    mMouseY = columnContentY(mMouseX, static_cast<float>((y - mOffY) / mScale));
 
     if (mScrollDrag) {
         // The thumb's travel is the track minus the thumb, and the scroll's range is mScrollMax,
@@ -2078,7 +2125,7 @@ void RationsEditorView::onMouseWheel(int x, int y, int delta)
             setScroll(mScrollY - delta * geo::kScrollWheelStep);
             return;
         }
-        const float cy = contentY(fy);
+        const float cy = columnContentY(fx, fy);
         // No scrollbar, so the wheel nudges whatever is under it — in whichever column that is.
         if (!geo::inSetupSettingsColumn(fx)) {
             const float bx = fx - static_cast<float>(geo::kSetupCabColX);

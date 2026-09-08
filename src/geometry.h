@@ -81,34 +81,45 @@ constexpr int kWinW = 1133;
 constexpr int kWinH = 403;
 
 // --- The setup page's two columns -------------------------------------------
-// The page is the window's width, and it is divided once, vertically.
+// The page is the window's width, and it is divided once, vertically, DOWN THE
+// MIDDLE. Both columns are the same width and each is drawn centred in its own
+// half, which is the author's call and is what the page now looks like.
 //
-// THE SPLIT IS ASYMMETRIC, AND THE SETTINGS COLUMN IS THE ONE THAT KEEPS ITS
-// SIZE. An even split would give each column 566 against the 640 both were
-// designed at — a 12% squeeze on each. That is affordable for the cabinet, whose
-// entire layout is derived from its column width already (the art is a photo and
-// scales; the blend dial is placed by fractions of it; the loader rows span it),
-// and it is NOT affordable for the settings column, which is a list of rows
-// carrying file paths, channel names and MIDI binding text at fixed sizes, with
-// a scrollbar reserved at its right edge. Squeezing the column that holds the
-// variable-length strings to save the column that holds a photograph is the
-// wrong way round.
+// The split was asymmetric first, and the reasoning for that is worth keeping
+// because it names the cost this pays. Both columns were designed at 640 as
+// pages of their own, so an even split is a 12% squeeze on each. That is free
+// for the cabinet, whose whole layout is derived from its column width already —
+// the art is a photograph and scales, the blend dial is placed by fractions of
+// it, the loader rows span it — and it is not free for the settings column,
+// which is a list of rows carrying file paths, channel names and MIDI binding
+// text at FIXED sizes with a scrollbar reserved at its right edge. Those strings
+// do not shrink with the column; they clip sooner. The first version therefore
+// gave the settings column its whole 640 and handed the cabinet the remainder.
 //
-// So the settings column keeps 640 exactly and every constant in it is
-// unchanged; the cabinet takes the remainder and re-derives. Nothing in the
-// cabinet block below needed editing to make that happen, which is the payoff
-// for it having been written against its page width rather than against
-// numbers.
-constexpr int kSetupSetColW = 640;
-constexpr int kSetupSetColX = kWinW - kSetupSetColW; // 493
+// An even split reads better and that is what it is for: two halves of one page
+// rather than a wide half and a narrow one. Everything below re-derives from
+// these two constants, so the change is here and nowhere else — which is the
+// payoff for both columns having been written against their own width rather
+// than against numbers. The cabinet gains what the settings column gives up: its
+// art goes from 449 units wide to 522.
+//
+// If a settings row ever turns out to clip something a user needs to read, the
+// answer is to shorten the string or to elide it in the middle — not to take the
+// width back, because the width is now a deliberate symmetry rather than a
+// leftover.
+constexpr int kSetupColW = kWinW / 2; // 566, and the odd unit falls between them
+constexpr int kSetupSetColW = kSetupColW;
+constexpr int kSetupSetColX = kWinW - kSetupSetColW; // 567, flush to the right edge
 constexpr int kSetupCabColX = 0;
-constexpr int kSetupCabColW = kSetupSetColX; // 493
+constexpr int kSetupCabColW = kSetupColW; // 566
+static_assert(kSetupCabColW == kSetupSetColW, "the setup page's two columns are equal halves");
+static_assert(kSetupCabColX + kSetupCabColW <= kSetupSetColX, "the two columns must not overlap");
 // Each column is drawn in its OWN coordinates, translated into place by the
 // painter — the same one-translate idiom the scroll already uses. That is what
 // lets the settings constants stay written against 640 and the cabinet's against
 // its own width, instead of every one of them growing a column offset.
-constexpr int kSetupCabColCX = kSetupCabColW / 2; // 246
-constexpr int kSetupSetColCX = kSetupSetColW / 2; // 320
+constexpr int kSetupCabColCX = kSetupCabColW / 2; // 283
+constexpr int kSetupSetColCX = kSetupSetColW / 2; // 283
 
 // The cabinet: art aspect 1483/872 = 1.7007, drawn as wide as its column allows
 // with the two IR rows underneath it and the page's chrome above.
@@ -968,8 +979,8 @@ constexpr int kPageContentTop = kBackButton.y + kBackButton.h + 10; // 50
 // it reading as a picture with two unrelated widgets under it: cabinet and rows
 // are one block, and the margin around them is even on all four sides.
 constexpr int kCabMargin = 22;
-constexpr int kCabW = kCabPageW - 2 * kCabMargin;      // 449
-constexpr int kCabH = (kCabW * 872 + 1483 / 2) / 1483; // 264, the art's own aspect
+constexpr int kCabW = kCabPageW - 2 * kCabMargin;      // 522
+constexpr int kCabH = (kCabW * 872 + 1483 / 2) / 1483; // 307, the art's own aspect
 constexpr int kCabX = kCabMargin;
 
 // The height of one file-loader row. Declared here rather than beside the two IR
@@ -1002,6 +1013,15 @@ constexpr int kCabBlockH = kCabH + kCabRowGap + kFileRowH;
 // correct trade: the opening size is the one a user sees every time, and a page
 // that re-centred as it was dragged would move its own contents under the
 // pointer.
+//
+// AND THIS COLUMN DOES NOT SCROLL. It is pinned while the settings list beside
+// it moves, so these two constants place it in the WINDOW rather than in the
+// page — which is why the band above is measured to the height the window opens
+// at and not to the page's 928. The one exception is a window too short to show
+// the block at all, where it slides up just far enough to bring its own bottom
+// edge on screen and then stops; that clamp is RationsEditorView::cabinetScroll,
+// and the second assert below is what guarantees the clamp is zero at every
+// window from the opening size up.
 constexpr int kCabY = kPageContentTop + (kSettingsDefaultViewH - kPageContentTop - kCabBlockH) / 2;
 static_assert(kCabY >= kPageContentTop,
               "the cabinet block is taller than the window the setup page opens at, so centring "
@@ -1036,9 +1056,9 @@ struct FileRow {
     const char *placeholder;
     const char *ext; // browser filter (no dot); empty = directories only
 };
-constexpr int kIrRowY = kCabY + kCabH + kCabRowGap; // 411
+constexpr int kIrRowY = kCabY + kCabH + kCabRowGap; // 432
 constexpr int kIrRowGap = 18;
-constexpr int kIrRowW = (kCabW - kIrRowGap) / 2; // 215
+constexpr int kIrRowW = (kCabW - kIrRowGap) / 2; // 252
 constexpr FileRow kIrRowA = {kCabX, kIrRowY, kIrRowW, kFileRowH, "Select IR...", "wav"};
 constexpr FileRow kIrRowB = {kCabX + kIrRowW + kIrRowGap, kIrRowY, kIrRowW, kFileRowH,
                              "Select IR (optional)...",   "wav"};
@@ -1077,7 +1097,7 @@ constexpr float kIrTextDX = 72.0f;
 // nearly agree.
 constexpr int kSettingsHeadingSize = 18;
 constexpr int kMidiRowX = 24;
-constexpr int kMidiRowW = kSettingsPageW - 2 * kMidiRowX; // 592
+constexpr int kMidiRowW = kSettingsPageW - 2 * kMidiRowX; // 518
 constexpr int kMidiRowH = 32;
 constexpr int kMidiRowPitch = 40;
 
@@ -1097,7 +1117,7 @@ static_assert(kSettingsMinViewH == kPageContentTop + 3 * kMidiRowPitch + 20,
 // colours, so they read as the same idea at two jobs.
 constexpr int kScrollBarW = 10;
 constexpr int kScrollBarInset = 6;
-constexpr int kScrollBarX = kSettingsPageW - kScrollBarInset - kScrollBarW; // 624
+constexpr int kScrollBarX = kSettingsPageW - kScrollBarInset - kScrollBarW; // 550
 constexpr float kScrollBarRadius = 5.0f;
 // A thumb proportional to the visible fraction, floored so that a long page
 // still leaves something to catch hold of.
@@ -1159,7 +1179,7 @@ constexpr int kCaptureNameW = 170;
 // box. Roboto rather than Michroma: a path is a variable-length string that has
 // to stay legible when clipped, which is the one thing this panel keeps a
 // proportional face for.
-constexpr int kCaptureTextX = kCaptureNameX + kCaptureNameW + 12; // 168
+constexpr int kCaptureTextX = kCaptureNameX + kCaptureNameW + 12; // 222
 constexpr int kCaptureClearW = 24;
 constexpr int kCaptureClearInset = 6;
 constexpr int kCaptureTextW = kMidiRowW - kCaptureClearInset - kCaptureClearW - kCaptureTextX - 8;
@@ -1348,7 +1368,7 @@ constexpr const char *kOutputFootnote =
 // sized to that page rather than to the head's.
 constexpr int kBrowserX = 16;
 constexpr int kBrowserY = 16;
-constexpr int kBrowserW = kCabPageW - 2 * kBrowserX; // 461
+constexpr int kBrowserW = kCabPageW - 2 * kBrowserX; // 534
 constexpr int kBrowserH = kCabPageH - 2 * kBrowserY; // 428
 
 // The settings page opens the same browser for its four capture rows, and it is
@@ -1358,8 +1378,8 @@ constexpr int kBrowserH = kCabPageH - 2 * kBrowserY; // 428
 // page it is drawn over.
 constexpr int kCaptureBrowserX = 16;
 constexpr int kCaptureBrowserY = 40;
-constexpr int kCaptureBrowserW = kSettingsPageW - 2 * kCaptureBrowserX; // 608
-constexpr int kCaptureBrowserH = kSettingsPageH - 2 * kCaptureBrowserY; // 1086
+constexpr int kCaptureBrowserW = kSettingsPageW - 2 * kCaptureBrowserX; // 534
+constexpr int kCaptureBrowserH = kSettingsPageH - 2 * kCaptureBrowserY; // 848
 // That height is a CEILING now, not the size: the settings page scrolls, so the
 // window showing it may be shorter than the page, and the card is sized to the
 // viewport instead (RationsEditorView::boundCaptureBrowser). This is the floor
