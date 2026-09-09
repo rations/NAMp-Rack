@@ -120,6 +120,7 @@ public:
                       uint32_t &seq) const override;
 
     uint32_t dropouts() const override;
+    std::string deviceSummary() const override;
 
 private:
     // True when ASIO is built in, the preference allows it, and the machine has a driver to try.

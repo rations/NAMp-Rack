@@ -67,6 +67,20 @@ JackClient::~JackClient()
 }
 
 //------------------------------------------------------------------------
+// The server's own numbers, and nothing about a device: on this platform the user chose their
+// interface when they started JACK, and naming one here would be reporting a choice this program did
+// not make and cannot change.
+std::string JackClient::deviceSummary() const
+{
+    if (!mClient)
+        return std::string();
+    char text[96];
+    std::snprintf(text, sizeof(text), "JACK %.0f Hz, %d frames", mSampleRate,
+                  mBlockSize.load(std::memory_order_relaxed));
+    return std::string(text);
+}
+
+//------------------------------------------------------------------------
 // A first connection just to learn the server's rate and block size. JackNoStartServer because this
 // is a question, not a request: a standalone that started a JACK server as a side effect of being
 // launched would be making a decision about the machine that is not its to make.

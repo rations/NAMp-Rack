@@ -100,6 +100,8 @@ public:
         return mXruns.load(std::memory_order_relaxed);
     }
 
+    std::string deviceSummary() const override;
+
 private:
     static int processTrampoline(jack_nframes_t nframes, void *arg);
     static int bufferSizeTrampoline(jack_nframes_t nframes, void *arg);

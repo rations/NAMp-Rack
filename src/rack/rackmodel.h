@@ -401,6 +401,37 @@ public:
     {
         return mSearchPaths;
     }
+    // One line describing the audio device, composed by the standalone because only it knows which
+    // backend is open — the rack draws a device, it does not choose one. Empty when there is no
+    // device, which is an ordinary state: the editor runs without one.
+    // Returns true when the text actually changed, so the caller can repaint only then: this is
+    // pushed on every UI tick and the answer is the same on almost all of them.
+    bool setAudioStatus(std::string status)
+    {
+        if (status == mAudioStatus)
+            return false;
+        mAudioStatus = std::move(status);
+        return true;
+    }
+    const std::string &audioStatus() const
+    {
+        return mAudioStatus;
+    }
+    // Dropouts the device has reported since it was opened. Shown beside the device because the two
+    // are read together: a figure with no device named beside it says nothing about which device
+    // produced it.
+    bool setAudioDropouts(uint32_t dropouts)
+    {
+        if (dropouts == mAudioDropouts)
+            return false;
+        mAudioDropouts = dropouts;
+        return true;
+    }
+    uint32_t audioDropouts() const
+    {
+        return mAudioDropouts;
+    }
+
     ScanState &scan()
     {
         return mScan;
@@ -446,6 +477,9 @@ private:
     int64_t latchDiagPeak(uint64_t id, int64_t micros);
     bool mDiagArmed = false;
     double mDiagPeriodMicros = 0.0;
+
+    std::string mAudioStatus;
+    uint32_t mAudioDropouts = 0;
 
     ViewMode mMode = ViewMode::List;
     int mListScroll = 0;

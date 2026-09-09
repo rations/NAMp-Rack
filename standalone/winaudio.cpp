@@ -212,4 +212,11 @@ uint32_t WinAudio::dropouts() const
     return mActive ? mActive->dropouts() : 0;
 }
 
+// Whichever is live describes itself; there is nothing useful this class could add that the backend
+// has not already said, and the backend's own name is the first word of it.
+std::string WinAudio::deviceSummary() const
+{
+    return mActive ? mActive->deviceSummary() : std::string();
+}
+
 } // namespace Rations

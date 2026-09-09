@@ -814,6 +814,20 @@ int AsioBackend::takeBufferSizeChange()
 }
 
 //------------------------------------------------------------------------
+// The driver's name is the whole point of this line: it is what the user chose, and on a machine with
+// more than one interface it is the only way to tell from the window which one is sounding.
+std::string AsioBackend::deviceSummary() const
+{
+    if (!isOpen())
+        return std::string();
+    char text[192];
+    std::snprintf(text, sizeof(text), "ASIO %s, %.0f Hz, %d frames",
+                  mOpenedDriver.empty() ? "(unnamed driver)" : mOpenedDriver.c_str(), mSampleRate,
+                  mBlockSize.load(std::memory_order_relaxed));
+    return std::string(text);
+}
+
+//------------------------------------------------------------------------
 bool AsioBackend::takeDeviceReset()
 {
     return mDeviceReset.exchange(false, std::memory_order_acquire);

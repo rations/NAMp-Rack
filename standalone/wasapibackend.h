@@ -208,6 +208,8 @@ public:
     // The three, separately, because they have different causes and different fixes: a capture
     // glitch is the system losing input, an underrun is this process being too slow, and a drift
     // correction is the cost of running two clocks. Shown in the setup page rather than only
+    std::string deviceSummary() const override;
+
     // summed.
     uint32_t captureGlitches() const
     {

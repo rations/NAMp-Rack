@@ -215,6 +215,8 @@ public:
                mLateBlocks.load(std::memory_order_relaxed);
     }
 
+    std::string deviceSummary() const override;
+
     // Whether the driver said it can report overloads at all (kAsioCanReportOverload, added to the
     // SDK in 2012). Printed at open, because "no dropouts" and "no counter" look identical in a log
     // and only one of them is good news.

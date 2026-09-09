@@ -541,6 +541,29 @@ int WasapiBackend::takeBufferSizeChange()
 }
 
 //------------------------------------------------------------------------
+// The share mode and the two-clock case are here because both are things the user did not ask for and
+// needs to know: exclusive mode may have been refused by whatever else holds the device, and a rig
+// with the guitar on an interface and the sound on the laptop's speakers is running two crystals. The
+// drift corrections are what that second one costs, so they are shown where it is named.
+std::string WasapiBackend::deviceSummary() const
+{
+    if (!isOpen())
+        return std::string();
+    char text[256];
+    const uint32_t drift = driftCorrections();
+    if (mTwoClocks)
+        std::snprintf(text, sizeof(text),
+                      "WASAPI %s, %.0f Hz, %d frames, two clocks (%u drift correction%s)",
+                      mOpenedExclusive ? "exclusive" : "shared", mSampleRate,
+                      mBlockSize.load(std::memory_order_relaxed), drift, drift == 1 ? "" : "s");
+    else
+        std::snprintf(text, sizeof(text), "WASAPI %s, %.0f Hz, %d frames",
+                      mOpenedExclusive ? "exclusive" : "shared", mSampleRate,
+                      mBlockSize.load(std::memory_order_relaxed));
+    return std::string(text);
+}
+
+//------------------------------------------------------------------------
 bool WasapiBackend::takeDeviceReset()
 {
     return mDeviceReset.exchange(false, std::memory_order_acquire);

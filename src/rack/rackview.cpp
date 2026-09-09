@@ -838,6 +838,7 @@ void RackView::drawFooter(Canvas &c)
     snprintf(text, sizeof(text), "%d pedal%s  ·  rack latency %u samples", count,
              count == 1 ? "" : "s", latency);
     c.drawString(text, kMargin, kRackH - 9.0f);
+    const float leftEnd = kMargin + c.stringWidth(text);
 
     // When diagnostics are armed the right-hand end of the footer is the summary rather than the
     // interaction hint: the whole reason to arm them is that something is costing more than it
@@ -868,12 +869,42 @@ void RackView::drawFooter(Canvas &c)
         return;
     }
 
+    // The interaction hint belongs to the mode that needs it: in List mode a row's controls are
+    // visible where they act, while a card view has to say that a cable is a drop target.
+    float rightStart = kRackW - kMargin;
     if (mModel->viewMode() == ViewMode::Nodes) {
         const char *hint = "drag a card onto a cable to splice it in  ·  right-click a cable to "
                            "take the pedal after it out";
         const float w = c.stringWidth(hint);
-        c.drawString(hint, kRackW - kMargin - w, kRackH - 9.0f);
+        rightStart = kRackW - kMargin - w;
+        c.drawString(hint, rightStart, kRackH - 9.0f);
     }
+
+    // THE DEVICE, IN WHATEVER IS LEFT BETWEEN THE TWO, and clipped to it rather than trusted to fit.
+    // An ASIO driver's name is whatever the vendor registered and a WASAPI endpoint's is whatever the
+    // user renamed it to, so its length is not this project's to know — and the two things either
+    // side of it are the pedal count and an interaction hint, both of which matter more than the last
+    // few characters of a device name.
+    const std::string &device = mModel->audioStatus();
+    if (device.empty())
+        return;
+
+    std::string status = device;
+    const uint32_t dropouts = mModel->audioDropouts();
+    if (dropouts > 0) {
+        char suffix[64];
+        snprintf(suffix, sizeof(suffix), "  ·  %u dropout%s", dropouts, dropouts == 1 ? "" : "s");
+        status += suffix;
+    }
+
+    const float gapX = leftEnd + kMargin;
+    const float gapW = rightStart - kMargin - gapX;
+    if (gapW <= 0.0f)
+        return;
+    // Red once there have been any: a dropout is the number the live gate is written against, so it
+    // is not something to mention in passing.
+    c.setColor(dropouts > 0 ? kDangerColor : kOffColor);
+    c.drawString(c.clipToWidth(status, gapW), gapX, kRackH - 9.0f);
 }
 
 //------------------------------------------------------------------------
