@@ -1,11 +1,15 @@
-// Sample-format conversion for the ASIO backend, and the one piece of the Windows audio path that
-// can be proved without Windows.
+// PCM sample-format conversion for BOTH Windows audio backends, and the one piece of the Windows
+// audio path that can be proved without Windows.
 //
-// WHY THIS IS ITS OWN HEADER, and why it includes nothing of ASIO's. An ASIO driver hands out its
-// buffers in whatever format the hardware uses — ASIOGetChannelInfo reports it per channel, and it
-// is emphatically NOT always float. Every one of those formats has to be read into, and written out
-// of, the float buffers the amp works in, and getting the scaling wrong by one bit or the sign
-// wrong on the negative side is a distortion nobody notices in the code and everybody hears.
+// WHY THIS IS ITS OWN HEADER, and why it includes nothing of either audio API's. An ASIO driver
+// hands out its buffers in whatever format the hardware uses — ASIOGetChannelInfo reports it per
+// channel, and it is emphatically NOT always float — and WASAPI in exclusive mode does exactly the
+// same thing through a WAVEFORMATEXTENSIBLE. The layouts the two describe are the SAME small set of
+// PCM layouts, so there is one conversion here and both backends use it: two copies of this
+// arithmetic would be two chances to get it wrong, and only one of them could be tested. Every one
+// of those formats has to be read into, and written out of, the float buffers the amp works in, and
+// getting the scaling wrong by one bit or the sign wrong on the negative side is a distortion
+// nobody notices in the code and everybody hears.
 //
 // A driver is not available on the development machine and cannot be, so the ONLY way to check this
 // arithmetic before it reaches a user is to check it offline against values written out by hand.
@@ -15,12 +19,21 @@
 // cannot drift apart.
 //
 // WHAT IS SUPPORTED, AND WHAT IS REFUSED. The little-endian integer and float formats, which are
-// what x86 hardware reports, plus the four right-aligned 32-bit variants. The big-endian ones are
-// REFUSED by name rather than guessed at: they exist for big-endian hardware, this product is
-// x86-64 Windows only, and a byte-swapping path that no machine here can exercise is a path that
-// would be wrong for as long as it went unnoticed. DSD is refused for the same reason and a better
-// one — it is a one-bit stream, not samples. A refused format is a named error at open() and a
-// backend that does not start, never silence and never noise.
+// what x86 hardware reports, plus the four right-aligned 32-bit variants — which is also exactly
+// what WASAPI expresses as wBitsPerSample 32 with wValidBitsPerSample 16, 18, 20 or 24. The
+// big-endian ones are REFUSED by name rather than guessed at: they exist for big-endian hardware,
+// this product is x86-64 Windows only, and a byte-swapping path that no machine here can exercise
+// is a path that would be wrong for as long as it went unnoticed. DSD is refused for the same
+// reason and a better one — it is a one-bit stream, not samples. A refused format is a named error
+// at open() and a backend that does not start, never silence and never noise.
+//
+// ONE PCM BUFFER MAY BE INTERLEAVED, AND THAT IS WHY EVERY FUNCTION TAKES A STRIDE. ASIO hands out
+// a separate buffer per channel, so its stride is 1. WASAPI hands out ONE buffer with the channels
+// interleaved frame by frame, so its stride is the stream's channel count and the pointer is offset
+// to the channel wanted. The float side is always contiguous, because that is what the amp works
+// in. Passing the wrong stride is not subtle — it is the left channel played at half speed — but it
+// is exactly the kind of thing a conversion written twice would get right once, which is the other
+// reason there is only one of these.
 //
 // THE SCALING RULE, chosen once and applied everywhere. Signed n-bit integers run from -2^(n-1) to
 // 2^(n-1)-1: the negative side has one more step than the positive one. Dividing by 2^(n-1) is
@@ -40,36 +53,42 @@
 namespace Rations
 {
 
-// The ASIO sample types this backend handles, with the SDK's own numeric values. Named here so this
-// header needs no ASIO include; asiobackend.cpp asserts each one against the SDK's enum.
-enum AsioSampleFormat {
-    kAsioFmtInt16LSB = 16,
-    kAsioFmtInt24LSB = 17,
-    kAsioFmtInt32LSB = 18,
-    kAsioFmtFloat32LSB = 19,
-    kAsioFmtFloat64LSB = 20,
+// The PCM layouts the Windows backends handle.
+//
+// THE NUMBERS ARE ASIO'S, and that is deliberate rather than accidental: one of the two callers
+// gets its format as an ASIOSampleType and can pass it straight through, while the other translates
+// a WAVEFORMATEXTENSIBLE into the same values. Named here rather than included, so this header
+// needs no ASIO SDK and can be compiled and proved on a machine that has neither SDK nor driver;
+// asiobackend.cpp static_asserts every one of them against the SDK's own enum, which is what keeps
+// the two from drifting.
+enum PcmSampleFormat {
+    kPcmInt16LSB = 16,
+    kPcmInt24LSB = 17,
+    kPcmInt32LSB = 18,
+    kPcmFloat32LSB = 19,
+    kPcmFloat64LSB = 20,
     // 32-bit containers holding fewer significant bits, right-aligned. The name says how many bits
     // are used, so the scaling factor differs per variant while the container size does not.
-    kAsioFmtInt32LSB16 = 24,
-    kAsioFmtInt32LSB18 = 25,
-    kAsioFmtInt32LSB20 = 26,
-    kAsioFmtInt32LSB24 = 27,
+    kPcmInt32LSB16 = 24,
+    kPcmInt32LSB18 = 25,
+    kPcmInt32LSB20 = 26,
+    kPcmInt32LSB24 = 27,
 };
 
 // True for a format the two functions below can actually carry. Everything else is refused at
 // open() with the number printed, so a report from a machine nobody here owns names the format.
-inline bool asioFormatSupported(int format)
+inline bool pcmFormatSupported(int format)
 {
     switch (format) {
-        case kAsioFmtInt16LSB:
-        case kAsioFmtInt24LSB:
-        case kAsioFmtInt32LSB:
-        case kAsioFmtFloat32LSB:
-        case kAsioFmtFloat64LSB:
-        case kAsioFmtInt32LSB16:
-        case kAsioFmtInt32LSB18:
-        case kAsioFmtInt32LSB20:
-        case kAsioFmtInt32LSB24:
+        case kPcmInt16LSB:
+        case kPcmInt24LSB:
+        case kPcmInt32LSB:
+        case kPcmFloat32LSB:
+        case kPcmFloat64LSB:
+        case kPcmInt32LSB16:
+        case kPcmInt32LSB18:
+        case kPcmInt32LSB20:
+        case kPcmInt32LSB24:
             return true;
         default:
             return false;
@@ -78,14 +97,14 @@ inline bool asioFormatSupported(int format)
 
 // Bytes one sample occupies in a driver buffer of this format. Needed to walk the buffer, and it is
 // NOT derivable from the bit count: Int32LSB16 carries 16 significant bits in 4 bytes.
-inline int asioBytesPerSample(int format)
+inline int pcmBytesPerSample(int format)
 {
     switch (format) {
-        case kAsioFmtInt16LSB:
+        case kPcmInt16LSB:
             return 2;
-        case kAsioFmtInt24LSB:
+        case kPcmInt24LSB:
             return 3;
-        case kAsioFmtFloat64LSB:
+        case kPcmFloat64LSB:
             return 8;
         default:
             return 4;
@@ -96,20 +115,20 @@ namespace detail
 {
 
 // The divisor that maps this format's full-scale integer to 1.0. A float format has none.
-inline double asioIntScale(int format)
+inline double pcmIntScale(int format)
 {
     switch (format) {
-        case kAsioFmtInt16LSB:
-        case kAsioFmtInt32LSB16:
+        case kPcmInt16LSB:
+        case kPcmInt32LSB16:
             return 32768.0; // 2^15
-        case kAsioFmtInt24LSB:
-        case kAsioFmtInt32LSB24:
+        case kPcmInt24LSB:
+        case kPcmInt32LSB24:
             return 8388608.0; // 2^23
-        case kAsioFmtInt32LSB18:
+        case kPcmInt32LSB18:
             return 131072.0; // 2^17
-        case kAsioFmtInt32LSB20:
+        case kPcmInt32LSB20:
             return 524288.0; // 2^19
-        case kAsioFmtInt32LSB:
+        case kPcmInt32LSB:
             return 2147483648.0; // 2^31
         default:
             return 0.0;
@@ -176,7 +195,7 @@ inline int32_t floatToInt(float v, double scale, int32_t lo, int32_t hi)
 // The inclusive range a format's integer samples occupy. Computed rather than cast from the scale,
 // because static_cast<int32_t>(2147483648.0) — which is what the full-scale 32-bit format's divisor
 // is — is undefined behaviour in itself.
-inline void asioIntRange(double divisor, int32_t &lo, int32_t &hi)
+inline void pcmIntRange(double divisor, int32_t &lo, int32_t &hi)
 {
     if (divisor >= 2147483648.0) {
         lo = INT32_MIN;
@@ -189,47 +208,56 @@ inline void asioIntRange(double divisor, int32_t &lo, int32_t &hi)
 
 } // namespace detail
 
-// One channel of a driver buffer into floats. `src` is the driver's buffer for this channel and
-// `frames` samples are read from it; nothing is allocated and nothing is locked, because this runs
-// inside the buffer switch.
-inline void asioToFloat(const void *src, int format, float *dst, int frames)
+// One channel of a device buffer into floats. `src` points at this channel's first sample and
+// `stride` says how many samples to skip between frames — 1 for a per-channel buffer, the channel
+// count for an interleaved one. Nothing is allocated and nothing is locked: this runs on the audio
+// thread.
+inline void pcmToFloat(const void *src, int format, float *dst, int frames, int stride = 1)
 {
     const unsigned char *in = static_cast<const unsigned char *>(src);
+    const size_t step =
+        static_cast<size_t>(pcmBytesPerSample(format)) * static_cast<size_t>(stride);
     switch (format) {
-        case kAsioFmtFloat32LSB:
-            // Already the format the amp works in. memcpy rather than a loop, and NOT a pointer
-            // alias: the driver's buffer is not guaranteed to be aligned for float access, and on
-            // the platforms where that matters it is a fault rather than a slowdown.
-            std::memcpy(dst, in, static_cast<size_t>(frames) * sizeof(float));
+        case kPcmFloat32LSB:
+            if (stride == 1) {
+                // Already the format the amp works in. memcpy rather than a loop, and NOT a pointer
+                // alias: the device's buffer is not guaranteed to be aligned for float access, and
+                // on the platforms where that matters it is a fault rather than a slowdown.
+                std::memcpy(dst, in, static_cast<size_t>(frames) * sizeof(float));
+                return;
+            }
+            for (int i = 0; i < frames; ++i)
+                std::memcpy(&dst[i], in + static_cast<size_t>(i) * step, sizeof(float));
             return;
-        case kAsioFmtFloat64LSB: {
+        case kPcmFloat64LSB: {
             for (int i = 0; i < frames; ++i) {
                 double v = 0.0;
-                std::memcpy(&v, in + static_cast<size_t>(i) * sizeof(double), sizeof(double));
+                std::memcpy(&v, in + static_cast<size_t>(i) * step, sizeof(double));
                 dst[i] = static_cast<float>(v);
             }
             return;
         }
-        case kAsioFmtInt16LSB: {
-            const double scale = 1.0 / detail::asioIntScale(format);
+        case kPcmInt16LSB: {
+            const double scale = 1.0 / detail::pcmIntScale(format);
             for (int i = 0; i < frames; ++i) {
                 int16_t v = 0;
-                std::memcpy(&v, in + static_cast<size_t>(i) * sizeof(int16_t), sizeof(int16_t));
+                std::memcpy(&v, in + static_cast<size_t>(i) * step, sizeof(int16_t));
                 dst[i] = static_cast<float>(static_cast<double>(v) * scale);
             }
             return;
         }
-        case kAsioFmtInt24LSB: {
-            const double scale = 1.0 / detail::asioIntScale(format);
+        case kPcmInt24LSB: {
+            const double scale = 1.0 / detail::pcmIntScale(format);
             for (int i = 0; i < frames; ++i)
                 dst[i] = static_cast<float>(
-                    static_cast<double>(detail::read24(in + static_cast<size_t>(i) * 3)) * scale);
+                    static_cast<double>(detail::read24(in + static_cast<size_t>(i) * step)) *
+                    scale);
             return;
         }
         default: {
             // The 32-bit container family: full-scale Int32LSB and the four right-aligned variants.
             // They differ only in the divisor.
-            const double divisor = detail::asioIntScale(format);
+            const double divisor = detail::pcmIntScale(format);
             if (divisor <= 0.0) {
                 // An unsupported format must never reach here — open() refuses them — but silence
                 // is the only safe thing to produce if one ever did.
@@ -239,7 +267,7 @@ inline void asioToFloat(const void *src, int format, float *dst, int frames)
             const double scale = 1.0 / divisor;
             for (int i = 0; i < frames; ++i) {
                 int32_t v = 0;
-                std::memcpy(&v, in + static_cast<size_t>(i) * sizeof(int32_t), sizeof(int32_t));
+                std::memcpy(&v, in + static_cast<size_t>(i) * step, sizeof(int32_t));
                 dst[i] = static_cast<float>(static_cast<double>(v) * scale);
             }
             return;
@@ -247,41 +275,53 @@ inline void asioToFloat(const void *src, int format, float *dst, int frames)
     }
 }
 
-// Floats into one channel of a driver buffer, the exact inverse of the above.
-inline void floatToAsio(const float *src, void *dst, int format, int frames)
+// Floats into one channel of a device buffer, the exact inverse of the above.
+inline void floatToPcm(const float *src, void *dst, int format, int frames, int stride = 1)
 {
     unsigned char *out = static_cast<unsigned char *>(dst);
+    const size_t step =
+        static_cast<size_t>(pcmBytesPerSample(format)) * static_cast<size_t>(stride);
     switch (format) {
-        case kAsioFmtFloat32LSB:
-            std::memcpy(out, src, static_cast<size_t>(frames) * sizeof(float));
+        case kPcmFloat32LSB:
+            if (stride == 1) {
+                std::memcpy(out, src, static_cast<size_t>(frames) * sizeof(float));
+                return;
+            }
+            for (int i = 0; i < frames; ++i)
+                std::memcpy(out + static_cast<size_t>(i) * step, &src[i], sizeof(float));
             return;
-        case kAsioFmtFloat64LSB: {
+        case kPcmFloat64LSB: {
             for (int i = 0; i < frames; ++i) {
                 const double v = static_cast<double>(src[i]);
-                std::memcpy(out + static_cast<size_t>(i) * sizeof(double), &v, sizeof(double));
+                std::memcpy(out + static_cast<size_t>(i) * step, &v, sizeof(double));
             }
             return;
         }
-        case kAsioFmtInt16LSB: {
-            const double scale = detail::asioIntScale(format);
+        case kPcmInt16LSB: {
+            const double scale = detail::pcmIntScale(format);
             for (int i = 0; i < frames; ++i) {
                 const int16_t v =
                     static_cast<int16_t>(detail::floatToInt(src[i], scale, -32768, 32767));
-                std::memcpy(out + static_cast<size_t>(i) * sizeof(int16_t), &v, sizeof(int16_t));
+                std::memcpy(out + static_cast<size_t>(i) * step, &v, sizeof(int16_t));
             }
             return;
         }
-        case kAsioFmtInt24LSB: {
-            const double scale = detail::asioIntScale(format);
+        case kPcmInt24LSB: {
+            const double scale = detail::pcmIntScale(format);
             for (int i = 0; i < frames; ++i)
-                detail::write24(out + static_cast<size_t>(i) * 3,
+                detail::write24(out + static_cast<size_t>(i) * step,
                                 detail::floatToInt(src[i], scale, -8388608, 8388607));
             return;
         }
         default: {
-            const double divisor = detail::asioIntScale(format);
+            const double divisor = detail::pcmIntScale(format);
             if (divisor <= 0.0) {
-                std::memset(out, 0, static_cast<size_t>(frames) * sizeof(int32_t));
+                // Per frame, not one memset: with a stride, a contiguous clear would silence the
+                // channels either side of this one as well. The float side above has no such
+                // problem, because the float side is always contiguous.
+                const int32_t zero = 0;
+                for (int i = 0; i < frames; ++i)
+                    std::memcpy(out + static_cast<size_t>(i) * step, &zero, sizeof(int32_t));
                 return;
             }
             // The right-aligned variants are clamped to THEIR OWN range, not to int32's: writing a
@@ -289,10 +329,10 @@ inline void floatToAsio(const float *src, void *dst, int format, int frames)
             // hardware does with the excess is its own business.
             int32_t lo = 0;
             int32_t hi = 0;
-            detail::asioIntRange(divisor, lo, hi);
+            detail::pcmIntRange(divisor, lo, hi);
             for (int i = 0; i < frames; ++i) {
                 const int32_t v = detail::floatToInt(src[i], divisor, lo, hi);
-                std::memcpy(out + static_cast<size_t>(i) * sizeof(int32_t), &v, sizeof(int32_t));
+                std::memcpy(out + static_cast<size_t>(i) * step, &v, sizeof(int32_t));
             }
             return;
         }

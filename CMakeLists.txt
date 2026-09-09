@@ -815,7 +815,7 @@ target_compile_options(NampRackRack PRIVATE -Wall)
 # quietly grow a dependency on either.
 #
 # NO -ffast-math ON THIS TARGET, and the absence is asserted rather than reviewed, exactly as it is
-# on NampRackHost and for the same reason one layer further down. asiosamples.h's float-to-integer
+# on NampRackHost and for the same reason one layer further down. pcmsamples.h's float-to-integer
 # conversion is the LAST place a NaN can be stopped before a float becomes a voltage, and it stops one
 # by testing positively for the in-range case; -ffinite-math-only tells the compiler NaN cannot
 # happen, which licenses it to treat that fallthrough as unreachable. The amp's own library IS built
@@ -824,9 +824,13 @@ target_compile_options(NampRackRack PRIVATE -Wall)
 if(WIN32)
     set(NAMPRACK_WIN_AUDIO_SOURCES
         ${NAMPRACK_ROOT}/standalone/audiobackend.h
-        ${NAMPRACK_ROOT}/standalone/asiosamples.h
+        ${NAMPRACK_ROOT}/standalone/pcmsamples.h
         ${NAMPRACK_ROOT}/standalone/winmmmidi.h
         ${NAMPRACK_ROOT}/standalone/winmmmidi.cpp
+        # WASAPI is the fallback and is ALWAYS built: it is what a machine with no vendor ASIO driver
+        # gets, so there is no configuration in which the Windows standalone can do without it.
+        ${NAMPRACK_ROOT}/standalone/wasapibackend.h
+        ${NAMPRACK_ROOT}/standalone/wasapibackend.cpp
     )
     if(NAMPRACK_WIN_ASIO)
         list(APPEND NAMPRACK_WIN_AUDIO_SOURCES
@@ -841,7 +845,11 @@ if(WIN32)
     add_library(NampRackWinAudio STATIC ${NAMPRACK_WIN_AUDIO_SOURCES})
     target_include_directories(NampRackWinAudio
         PUBLIC ${NAMPRACK_ROOT}/src ${NAMPRACK_ROOT}/standalone)
-    target_link_libraries(NampRackWinAudio PUBLIC NampRackHost sdk_hosting winmm)
+    # winmm for the MIDI input, ole32 for the COM the audio endpoints are, avrt for the audio
+    # thread's scheduling class, ksuser for the KSDATAFORMAT subtype GUIDs a WAVEFORMATEXTENSIBLE
+    # names, uuid for the interface IIDs __uuidof resolves to.
+    target_link_libraries(NampRackWinAudio
+        PUBLIC NampRackHost sdk_hosting winmm ole32 avrt ksuser uuid)
     target_compile_features(NampRackWinAudio PUBLIC cxx_std_17)
     # -Wall on our files only; the SDK's sources are upstream text compiled as they are.
     target_compile_options(NampRackWinAudio PRIVATE -Wall)
@@ -860,8 +868,6 @@ if(WIN32)
             ${NAMPRACK_ASIO_SDK_DIR}/common
             ${NAMPRACK_ASIO_SDK_DIR}/host
             ${NAMPRACK_ASIO_SDK_DIR}/host/pc)
-        # ole32 for CoInitialize and CoCreateInstance: an ASIO driver is a COM object.
-        target_link_libraries(NampRackWinAudio PUBLIC ole32)
     else()
         target_compile_definitions(NampRackWinAudio PUBLIC NAMPRACK_HAVE_ASIO=0)
     endif()
@@ -869,7 +875,7 @@ if(WIN32)
     get_target_property(_namprack_winaudio_flags NampRackWinAudio COMPILE_OPTIONS)
     if(_namprack_winaudio_flags MATCHES "ffast-math|ffinite-math-only")
         message(FATAL_ERROR
-            "NampRackWinAudio carries ${_namprack_winaudio_flags}. asiosamples.h's conversion is "
+            "NampRackWinAudio carries ${_namprack_winaudio_flags}. pcmsamples.h's conversion is "
             "what stops a NaN from becoming a full-scale square wave at the device, and "
             "-ffinite-math-only lets the compiler delete the test that does it. Whatever added that "
             "flag has to exclude this target.")

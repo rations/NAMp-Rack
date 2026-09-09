@@ -10,12 +10,12 @@
 // the one part that is wrong SILENTLY — a bad scale factor is a quiet or clipped signal, a bad sign
 // is inverted polarity, a mishandled NaN is full-scale noise — and it is exactly the kind of thing
 // that can be checked against values written out by hand. That is what this does, and it is why
-// asiosamples.h includes nothing of ASIO's: this runs on the machine the gate runs on.
+// pcmsamples.h includes nothing of ASIO's: this runs on the machine the gate runs on.
 //
 // It links nothing at all. No VST3, no graphics, no host layer — one header and the standard
 // library, so a failure here is the arithmetic and cannot be anything else.
 
-#include "asiosamples.h"
+#include "pcmsamples.h"
 
 #include <cmath>
 #include <cstdint>
@@ -43,23 +43,23 @@ void check(bool ok, const std::string &what)
 const char *formatName(int format)
 {
     switch (format) {
-        case kAsioFmtInt16LSB:
+        case kPcmInt16LSB:
             return "Int16LSB";
-        case kAsioFmtInt24LSB:
+        case kPcmInt24LSB:
             return "Int24LSB";
-        case kAsioFmtInt32LSB:
+        case kPcmInt32LSB:
             return "Int32LSB";
-        case kAsioFmtFloat32LSB:
+        case kPcmFloat32LSB:
             return "Float32LSB";
-        case kAsioFmtFloat64LSB:
+        case kPcmFloat64LSB:
             return "Float64LSB";
-        case kAsioFmtInt32LSB16:
+        case kPcmInt32LSB16:
             return "Int32LSB16";
-        case kAsioFmtInt32LSB18:
+        case kPcmInt32LSB18:
             return "Int32LSB18";
-        case kAsioFmtInt32LSB20:
+        case kPcmInt32LSB20:
             return "Int32LSB20";
-        case kAsioFmtInt32LSB24:
+        case kPcmInt32LSB24:
             return "Int32LSB24";
         default:
             return "?";
@@ -68,32 +68,32 @@ const char *formatName(int format)
 
 // Every format the backend claims to handle. The list is written out rather than derived, so a
 // format added to the header without a thought about this gate shows up as a gap here.
-const int kFormats[] = {kAsioFmtInt16LSB,   kAsioFmtInt24LSB,   kAsioFmtInt32LSB,
-                        kAsioFmtFloat32LSB, kAsioFmtFloat64LSB, kAsioFmtInt32LSB16,
-                        kAsioFmtInt32LSB18, kAsioFmtInt32LSB20, kAsioFmtInt32LSB24};
+const int kFormats[] = {kPcmInt16LSB,   kPcmInt24LSB,   kPcmInt32LSB,
+                        kPcmFloat32LSB, kPcmFloat64LSB, kPcmInt32LSB16,
+                        kPcmInt32LSB18, kPcmInt32LSB20, kPcmInt32LSB24};
 
 // The quantisation step of one format, as a fraction of full scale. A round trip through an integer
 // format can lose up to half a step, so this is what "identical" has to mean.
 double stepOf(int format)
 {
     switch (format) {
-        case kAsioFmtFloat32LSB:
+        case kPcmFloat32LSB:
             return 0.0;
-        case kAsioFmtFloat64LSB:
+        case kPcmFloat64LSB:
             // The float round trip goes through a float on our side, so the loss is float's, not
             // double's: one ULP near 1.0 is 2^-23.
             return 1.0 / 8388608.0;
-        case kAsioFmtInt16LSB:
-        case kAsioFmtInt32LSB16:
+        case kPcmInt16LSB:
+        case kPcmInt32LSB16:
             return 1.0 / 32768.0;
-        case kAsioFmtInt32LSB18:
+        case kPcmInt32LSB18:
             return 1.0 / 131072.0;
-        case kAsioFmtInt32LSB20:
+        case kPcmInt32LSB20:
             return 1.0 / 524288.0;
-        case kAsioFmtInt24LSB:
-        case kAsioFmtInt32LSB24:
+        case kPcmInt24LSB:
+        case kPcmInt32LSB24:
             return 1.0 / 8388608.0;
-        case kAsioFmtInt32LSB:
+        case kPcmInt32LSB:
             // Full-scale 32-bit, round-tripped through a 32-bit float on our side, so the step that
             // matters is again float's rather than the format's.
             return 1.0 / 8388608.0;
@@ -112,25 +112,25 @@ int main()
     std::printf("\nwhat the backend says it can carry\n");
     {
         for (const int f : kFormats)
-            check(asioFormatSupported(f), std::string(formatName(f)) + " is supported");
+            check(pcmFormatSupported(f), std::string(formatName(f)) + " is supported");
         // The big-endian and DSD families are refused BY NAME rather than guessed at — see the
         // header. A silently-accepted format nobody can test is worse than a named refusal.
-        check(!asioFormatSupported(0), "Int16MSB is refused rather than byte-swapped on a guess");
-        check(!asioFormatSupported(3), "Float32MSB is refused");
-        check(!asioFormatSupported(32), "DSD is refused - it is a bit stream, not samples");
-        check(!asioFormatSupported(-1) && !asioFormatSupported(9999),
+        check(!pcmFormatSupported(0), "Int16MSB is refused rather than byte-swapped on a guess");
+        check(!pcmFormatSupported(3), "Float32MSB is refused");
+        check(!pcmFormatSupported(32), "DSD is refused - it is a bit stream, not samples");
+        check(!pcmFormatSupported(-1) && !pcmFormatSupported(9999),
               "...and so is a value no SDK ever defined");
     }
 
     std::printf("\nthe sizes the buffer walk depends on\n");
     {
-        check(asioBytesPerSample(kAsioFmtInt16LSB) == 2, "Int16LSB is 2 bytes");
-        check(asioBytesPerSample(kAsioFmtInt24LSB) == 3,
+        check(pcmBytesPerSample(kPcmInt16LSB) == 2, "Int16LSB is 2 bytes");
+        check(pcmBytesPerSample(kPcmInt24LSB) == 3,
               "Int24LSB is 3 - packed, not padded, which is why it is read byte by byte");
-        check(asioBytesPerSample(kAsioFmtInt32LSB) == 4, "Int32LSB is 4");
-        check(asioBytesPerSample(kAsioFmtFloat32LSB) == 4, "Float32LSB is 4");
-        check(asioBytesPerSample(kAsioFmtFloat64LSB) == 8, "Float64LSB is 8");
-        check(asioBytesPerSample(kAsioFmtInt32LSB16) == 4,
+        check(pcmBytesPerSample(kPcmInt32LSB) == 4, "Int32LSB is 4");
+        check(pcmBytesPerSample(kPcmFloat32LSB) == 4, "Float32LSB is 4");
+        check(pcmBytesPerSample(kPcmFloat64LSB) == 8, "Float64LSB is 8");
+        check(pcmBytesPerSample(kPcmInt32LSB16) == 4,
               "Int32LSB16 is 4 - 16 significant bits in a 32-bit container");
     }
 
@@ -142,11 +142,11 @@ int main()
         for (const int f : kFormats) {
             const int n = 4;
             const float in[4] = {0.0f, 0.5f, -0.5f, -1.0f};
-            std::vector<unsigned char> raw(static_cast<size_t>(n * asioBytesPerSample(f)));
+            std::vector<unsigned char> raw(static_cast<size_t>(n * pcmBytesPerSample(f)));
             float out[4] = {9.0f, 9.0f, 9.0f, 9.0f};
 
-            floatToAsio(in, raw.data(), f, n);
-            asioToFloat(raw.data(), f, out, n);
+            floatToPcm(in, raw.data(), f, n);
+            pcmToFloat(raw.data(), f, out, n);
 
             const double tol = stepOf(f);
             bool ok = out[0] == 0.0f;
@@ -170,10 +170,10 @@ int main()
             in[static_cast<size_t>(i)] = -1.0f + 2.0f * static_cast<float>(i) / (n - 1);
 
         for (const int f : kFormats) {
-            std::vector<unsigned char> raw(static_cast<size_t>(n * asioBytesPerSample(f)));
+            std::vector<unsigned char> raw(static_cast<size_t>(n * pcmBytesPerSample(f)));
             std::vector<float> out(n, 9.0f);
-            floatToAsio(in.data(), raw.data(), f, n);
-            asioToFloat(raw.data(), f, out.data(), n);
+            floatToPcm(in.data(), raw.data(), f, n);
+            pcmToFloat(raw.data(), f, out.data(), n);
 
             double worst = 0.0;
             for (int i = 0; i < n; ++i)
@@ -194,26 +194,25 @@ int main()
         // A round trip cannot tell a correct conversion from one that inverts twice. What can is
         // the raw integer itself: it has to rise with the input across the whole range.
         for (const int f : kFormats) {
-            if (f == kAsioFmtFloat32LSB || f == kAsioFmtFloat64LSB)
+            if (f == kPcmFloat32LSB || f == kPcmFloat64LSB)
                 continue; // no integer to inspect
             constexpr int n = 256;
             std::vector<float> in(n);
             for (int i = 0; i < n; ++i)
                 in[static_cast<size_t>(i)] = -1.0f + 2.0f * static_cast<float>(i) / (n - 1);
-            std::vector<unsigned char> raw(static_cast<size_t>(n * asioBytesPerSample(f)));
-            floatToAsio(in.data(), raw.data(), f, n);
+            std::vector<unsigned char> raw(static_cast<size_t>(n * pcmBytesPerSample(f)));
+            floatToPcm(in.data(), raw.data(), f, n);
 
             bool rising = true;
             int64_t previous = INT64_MIN;
             for (int i = 0; i < n; ++i) {
-                const unsigned char *p =
-                    raw.data() + static_cast<size_t>(i * asioBytesPerSample(f));
+                const unsigned char *p = raw.data() + static_cast<size_t>(i * pcmBytesPerSample(f));
                 int64_t v = 0;
-                if (f == kAsioFmtInt16LSB) {
+                if (f == kPcmInt16LSB) {
                     int16_t s = 0;
                     std::memcpy(&s, p, sizeof(s));
                     v = s;
-                } else if (f == kAsioFmtInt24LSB) {
+                } else if (f == kPcmInt24LSB) {
                     const uint32_t rawv = static_cast<uint32_t>(p[0]) |
                                           (static_cast<uint32_t>(p[1]) << 8) |
                                           (static_cast<uint32_t>(p[2]) << 16);
@@ -230,6 +229,76 @@ int main()
         }
     }
 
+    std::printf("\ninterleaved, which is how WASAPI hands out a buffer and ASIO never does\n");
+    {
+        // The stride is the difference between the two backends' buffers, and getting it wrong is
+        // one channel played at half speed. Checked by building a THREE-channel interleaved buffer,
+        // writing a different signal into each, and reading each back on its own: a stride error
+        // shows up as one channel carrying another's samples.
+        constexpr int frames = 64;
+        constexpr int channels = 3;
+        for (const int f : kFormats) {
+            const int bytes = pcmBytesPerSample(f);
+            std::vector<unsigned char> raw(static_cast<size_t>(frames * channels * bytes), 0xcd);
+            std::vector<float> in[channels];
+            for (int c = 0; c < channels; ++c) {
+                in[c].resize(frames);
+                for (int i = 0; i < frames; ++i) {
+                    // A different ramp per channel, so a swap is visible rather than plausible.
+                    const float t = static_cast<float>(i) / (frames - 1);
+                    in[c][static_cast<size_t>(i)] = (c == 0)   ? (2.0f * t - 1.0f)
+                                                    : (c == 1) ? (-0.5f * t)
+                                                               : (0.25f);
+                }
+                floatToPcm(in[c].data(), raw.data() + static_cast<size_t>(c * bytes), f, frames,
+                           channels);
+            }
+
+            bool ok = true;
+            double worst = 0.0;
+            for (int c = 0; c < channels; ++c) {
+                std::vector<float> out(frames, 9.0f);
+                pcmToFloat(raw.data() + static_cast<size_t>(c * bytes), f, out.data(), frames,
+                           channels);
+                for (int i = 0; i < frames; ++i)
+                    worst = std::max(worst,
+                                     std::fabs(static_cast<double>(out[static_cast<size_t>(i)]) -
+                                               static_cast<double>(in[c][static_cast<size_t>(i)])));
+            }
+            const double allowed = stepOf(f);
+            ok = worst <= allowed;
+            char note[112];
+            std::snprintf(note, sizeof(note),
+                          "%s: three interleaved channels stay separate, worst |delta| %.3g",
+                          formatName(f), worst);
+            check(ok, note);
+        }
+
+        // And the one thing a per-channel read cannot catch: writing one channel must not touch its
+        // neighbours. The buffer starts filled with a sentinel and only the middle channel is
+        // written, so anything else that moved is a stride or a length error.
+        for (const int f : kFormats) {
+            const int bytes = pcmBytesPerSample(f);
+            std::vector<unsigned char> raw(static_cast<size_t>(frames * channels * bytes), 0x5a);
+            std::vector<float> ramp(frames, 0.5f);
+            floatToPcm(ramp.data(), raw.data() + static_cast<size_t>(bytes), f, frames, channels);
+
+            bool untouched = true;
+            for (int i = 0; i < frames; ++i) {
+                for (int c = 0; c < channels; ++c) {
+                    if (c == 1)
+                        continue;
+                    const unsigned char *p =
+                        raw.data() + static_cast<size_t>((i * channels + c) * bytes);
+                    for (int b = 0; b < bytes; ++b)
+                        untouched = untouched && p[b] == 0x5a;
+                }
+            }
+            check(untouched, std::string(formatName(f)) +
+                                 ": writing one interleaved channel leaves the others alone");
+        }
+    }
+
     std::printf("\nwhat happens to a sample the amp should never have produced\n");
     {
         // RULES: nothing non-finite reaches a speaker. The end-of-chain clamp is the first line of
@@ -241,12 +310,12 @@ int main()
         const float in[6] = {nan, -nan, inf, -inf, 4.0f, -4.0f};
 
         for (const int f : kFormats) {
-            std::vector<unsigned char> raw(static_cast<size_t>(6 * asioBytesPerSample(f)));
+            std::vector<unsigned char> raw(static_cast<size_t>(6 * pcmBytesPerSample(f)));
             std::vector<float> out(6, 9.0f);
-            floatToAsio(in, raw.data(), f, 6);
-            asioToFloat(raw.data(), f, out.data(), 6);
+            floatToPcm(in, raw.data(), f, 6);
+            pcmToFloat(raw.data(), f, out.data(), 6);
 
-            if (f == kAsioFmtFloat32LSB || f == kAsioFmtFloat64LSB) {
+            if (f == kPcmFloat32LSB || f == kPcmFloat64LSB) {
                 // A float format is handed to the hardware as-is: there is no integer to wrap and
                 // nothing this conversion can do about it, so this is the clamp's job upstream and
                 // the check here is only that the transport is faithful.

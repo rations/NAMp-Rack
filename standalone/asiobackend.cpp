@@ -2,7 +2,7 @@
 // the contract it implements.
 
 #include "asiobackend.h"
-#include "asiosamples.h"
+#include "pcmsamples.h"
 
 #include "host/hostapp.h"
 
@@ -72,7 +72,7 @@ constexpr int kAsioNameLength = 32;
 AsioBackend *gBackend = nullptr;
 
 //------------------------------------------------------------------------
-// The SDK's enum values, asserted against the copies in asiosamples.h. Cast on OUR side, because
+// The SDK's enum values, asserted against the copies in pcmsamples.h. Cast on OUR side, because
 // the two are distinct enumeration types and comparing them bare is a warning in itself — what is
 // being read is still the SDK's value.
 //
@@ -80,24 +80,24 @@ AsioBackend *gBackend = nullptr;
 // compiled and proved on a machine with no SDK and no driver. These asserts are what keeps the two
 // from drifting: a renumbering upstream fails the build here rather than silently converting one
 // format as another.
-static_assert(static_cast<int>(kAsioFmtInt16LSB) == ASIOSTInt16LSB,
-              "asiosamples.h disagrees with the SDK");
-static_assert(static_cast<int>(kAsioFmtInt24LSB) == ASIOSTInt24LSB,
-              "asiosamples.h disagrees with the SDK");
-static_assert(static_cast<int>(kAsioFmtInt32LSB) == ASIOSTInt32LSB,
-              "asiosamples.h disagrees with the SDK");
-static_assert(static_cast<int>(kAsioFmtFloat32LSB) == ASIOSTFloat32LSB,
-              "asiosamples.h disagrees with the SDK");
-static_assert(static_cast<int>(kAsioFmtFloat64LSB) == ASIOSTFloat64LSB,
-              "asiosamples.h disagrees with the SDK");
-static_assert(static_cast<int>(kAsioFmtInt32LSB16) == ASIOSTInt32LSB16,
-              "asiosamples.h disagrees with the SDK");
-static_assert(static_cast<int>(kAsioFmtInt32LSB18) == ASIOSTInt32LSB18,
-              "asiosamples.h disagrees with the SDK");
-static_assert(static_cast<int>(kAsioFmtInt32LSB20) == ASIOSTInt32LSB20,
-              "asiosamples.h disagrees with the SDK");
-static_assert(static_cast<int>(kAsioFmtInt32LSB24) == ASIOSTInt32LSB24,
-              "asiosamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmInt16LSB) == ASIOSTInt16LSB,
+              "pcmsamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmInt24LSB) == ASIOSTInt24LSB,
+              "pcmsamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmInt32LSB) == ASIOSTInt32LSB,
+              "pcmsamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmFloat32LSB) == ASIOSTFloat32LSB,
+              "pcmsamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmFloat64LSB) == ASIOSTFloat64LSB,
+              "pcmsamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmInt32LSB16) == ASIOSTInt32LSB16,
+              "pcmsamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmInt32LSB18) == ASIOSTInt32LSB18,
+              "pcmsamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmInt32LSB20) == ASIOSTInt32LSB20,
+              "pcmsamples.h disagrees with the SDK");
+static_assert(static_cast<int>(kPcmInt32LSB24) == ASIOSTInt32LSB24,
+              "pcmsamples.h disagrees with the SDK");
 
 //------------------------------------------------------------------------
 // The SDK's callbacks. Each is a thin forward to the one backend; none may do anything else,
@@ -402,7 +402,7 @@ bool AsioBackend::openDriver(std::string &error)
     }
 
     // The formats of the three channels this backend will actually use, asked per channel because
-    // ASIO permits them to differ — and refused by name if any is one asiosamples.h cannot carry,
+    // ASIO permits them to differ — and refused by name if any is one pcmsamples.h cannot carry,
     // rather than played as noise.
     struct Wanted {
         long channel;
@@ -422,7 +422,7 @@ bool AsioBackend::openDriver(std::string &error)
             error = "the driver would not describe one of its channels";
             return false;
         }
-        if (!asioFormatSupported(static_cast<int>(channelInfo.type))) {
+        if (!pcmFormatSupported(static_cast<int>(channelInfo.type))) {
             char detail[192];
             std::snprintf(detail, sizeof(detail),
                           "%s uses ASIO sample type %ld, which this build does not convert. The "
@@ -943,8 +943,8 @@ void AsioBackend::bufferSwitch(long doubleBufferIndex)
         for (int channel = 0; channel < 2; ++channel) {
             std::memset(mOutputFloat[channel].data(), 0,
                         static_cast<size_t>(frames) * sizeof(float));
-            floatToAsio(mOutputFloat[channel].data(), outBuffers[channel], mOut[channel].format,
-                        frames);
+            floatToPcm(mOutputFloat[channel].data(), outBuffers[channel], mOut[channel].format,
+                       frames);
         }
         if (mUseOutputReady)
             ASIOOutputReady();
@@ -952,7 +952,7 @@ void AsioBackend::bufferSwitch(long doubleBufferIndex)
         return;
     }
 
-    asioToFloat(inBuffer, mIn.format, mInputFloat.data(), frames);
+    pcmToFloat(inBuffer, mIn.format, mInputFloat.data(), frames);
 
     mInputChanges.clearQueue();
     mOutputChanges.clearQueue();
@@ -1012,8 +1012,7 @@ void AsioBackend::bufferSwitch(long doubleBufferIndex)
     }
 
     for (int channel = 0; channel < 2; ++channel)
-        floatToAsio(mOutputFloat[channel].data(), outBuffers[channel], mOut[channel].format,
-                    frames);
+        floatToPcm(mOutputFloat[channel].data(), outBuffers[channel], mOut[channel].format, frames);
 
     // Tells the driver the output half is complete, which saves it a block of latency. Called for
     // every block or for none, per the SDK's contract.

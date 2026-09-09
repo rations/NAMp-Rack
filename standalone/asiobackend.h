@@ -15,8 +15,9 @@
 //   * THE BUFFERS ARE NOT FLOATS. A driver hands out its own format — ASIOGetChannelInfo reports it
 //     per channel and it is commonly 32-bit integer — so unlike the JACK backend, which aims the
 //     VST3 bus pointers straight at JACK's memory, this one converts into float buffers of its own
-//     and converts back out. asiosamples.h is that arithmetic, and it is proved offline by
-//     tools/namp_audiocheck because no driver exists on the machine this is written on.
+//     and converts back out. pcmsamples.h is that arithmetic — shared with the WASAPI backend,
+//     because the layouts the two APIs describe are the same ones — and it is proved offline by
+//     tools/namp_audiocheck, because no driver exists on the machine this is written on.
 //
 //   * MIDI IS A THIRD API. ASIO carries none, so the footswitch arrives through WinMM on a thread
 //     the operating system owns and crosses into the audio thread through a ring. See winmmmidi.h.
