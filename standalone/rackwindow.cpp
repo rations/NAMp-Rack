@@ -8,6 +8,10 @@
 
 #include <cairo/cairo-xlib.h>
 
+// XK_* for the key mapping, and XLookupString's declaration.
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+
 #include <cstdio>
 
 namespace Rations
@@ -68,9 +72,13 @@ bool RackWindow::create(::Window parent, int x, int y, int w, int h)
 
     // Unlike the top-level, this window wants input: the rack is the one part of the interface the
     // standalone draws and handles itself.
+    //
+    // KeyPressMask and FocusChangeMask are here for the preset name field and nothing else. The
+    // mask alone claims no keys: X routes a key to this window only while it holds the input focus,
+    // and the focus is taken only around an open field (setKeyboardFocus).
     XSelectInput(display, mWindow,
                  ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                     LeaveWindowMask | StructureNotifyMask);
+                     LeaveWindowMask | StructureNotifyMask | KeyPressMask | FocusChangeMask);
     mLoop.addWindow(mWindow, [this](const XEvent &event) { onXEvent(event); });
 
     Visual *visual = DefaultVisual(display, screen);
@@ -96,6 +104,9 @@ bool RackWindow::create(::Window parent, int x, int y, int w, int h)
 //------------------------------------------------------------------------
 void RackWindow::destroy()
 {
+    // Never leave the focus pointed at a window that is about to stop existing.
+    setKeyboardFocus(false);
+
     if (mBuffer) {
         cairo_surface_destroy(mBuffer);
         mBuffer = nullptr;
@@ -243,6 +254,96 @@ void RackWindow::endScanProgress()
 }
 
 //------------------------------------------------------------------------
+// Ported from the editor's X11 view, which had to answer the same question first. The mapping of
+// X modifier masks onto KeyModifier is the part worth reading twice: KeyModifier documents
+// kCommandKey as "Windows: ctrl key" and kControlKey as "Windows: win key", so ControlMask is
+// kCommandKey here and Mod4 (Super) is kControlKey. The other way round makes Ctrl-C read as a
+// plain C.
+namespace
+{
+
+Steinberg::int16 virtualKeyFromKeySym(KeySym sym)
+{
+    switch (sym) {
+        case XK_BackSpace:
+            return Steinberg::KEY_BACK;
+        case XK_Tab:
+            return Steinberg::KEY_TAB;
+        case XK_Return:
+            return Steinberg::KEY_RETURN;
+        case XK_KP_Enter:
+            return Steinberg::KEY_ENTER;
+        case XK_Escape:
+            return Steinberg::KEY_ESCAPE;
+        case XK_Delete:
+        case XK_KP_Delete:
+            return Steinberg::KEY_DELETE;
+        case XK_Left:
+        case XK_KP_Left:
+            return Steinberg::KEY_LEFT;
+        case XK_Right:
+        case XK_KP_Right:
+            return Steinberg::KEY_RIGHT;
+        case XK_Home:
+        case XK_KP_Home:
+            return Steinberg::KEY_HOME;
+        case XK_End:
+        case XK_KP_End:
+            return Steinberg::KEY_END;
+        default:
+            return 0;
+    }
+}
+
+} // namespace
+
+//------------------------------------------------------------------------
+void RackWindow::setKeyboardFocus(bool wanted)
+{
+    Display *display = mLoop.display();
+    if (!display || !mWindow || wanted == mKeyFocus)
+        return;
+
+    if (wanted) {
+        // XSetInputFocus on a window that is not viewable is a BadMatch.
+        XWindowAttributes attrs;
+        if (XGetWindowAttributes(display, mWindow, &attrs) == 0 || attrs.map_state != IsViewable)
+            return;
+        ::Window focus = 0;
+        int revert = RevertToParent;
+        XGetInputFocus(display, &focus, &revert);
+        mPrevFocus = focus;
+        mPrevRevert = revert;
+        XSetInputFocus(display, mWindow, RevertToParent, CurrentTime);
+        XFlush(display);
+        mKeyFocus = true;
+        return;
+    }
+
+    mKeyFocus = false;
+    const ::Window prev = mPrevFocus;
+    mPrevFocus = 0;
+    // PointerRoot and None are legal focus values in their own right and are handed back as they
+    // are; a real window may have been destroyed while we held the focus, so it is probed first
+    // rather than trusted. A failed probe leaves the focus here — wrong, but far better than
+    // pointing it at a dead id.
+    if (prev == PointerRoot || prev == None) {
+        XSetInputFocus(display, prev, mPrevRevert, CurrentTime);
+    } else if (prev != mWindow) {
+        XWindowAttributes attrs;
+        if (XGetWindowAttributes(display, prev, &attrs) != 0)
+            XSetInputFocus(display, prev, mPrevRevert, CurrentTime);
+    }
+    XFlush(display);
+}
+
+//------------------------------------------------------------------------
+void RackWindow::syncKeyboardFocus()
+{
+    setKeyboardFocus(mView.wantsKeyboard());
+}
+
+//------------------------------------------------------------------------
 void RackWindow::onXEvent(const XEvent &event)
 {
     // Nothing here paints. Every branch either updates state or asks for a repaint on the next
@@ -261,6 +362,45 @@ void RackWindow::onXEvent(const XEvent &event)
                 resizeSurfaces(mWidth, mHeight);
             }
             mDirty = true;
+            return;
+
+        case KeyPress: {
+            // XLookupString applies the shift and lock state and yields the Latin-1 byte, which is
+            // why the character comes from it rather than from the keysym by hand. One byte is
+            // asked for because the field is ASCII only; a longer answer is a multi-byte character
+            // the field cannot store.
+            XKeyEvent ke = event.xkey;
+            char text[8] = {0};
+            KeySym sym = NoSymbol;
+            const int n = XLookupString(&ke, text, sizeof(text) - 1, &sym, nullptr);
+            const unsigned char byte = (n >= 1) ? static_cast<unsigned char>(text[0]) : 0;
+            const Steinberg::char16 ch =
+                (byte >= 0x20 && byte < 0x7F) ? static_cast<Steinberg::char16>(byte) : 0;
+
+            Steinberg::int16 mods = 0;
+            if (ke.state & ShiftMask)
+                mods |= Steinberg::kShiftKey;
+            if (ke.state & ControlMask)
+                mods |= Steinberg::kCommandKey;
+            if (ke.state & Mod1Mask)
+                mods |= Steinberg::kAlternateKey;
+            if (ke.state & Mod4Mask)
+                mods |= Steinberg::kControlKey;
+
+            const NAMp::rack::RackAction action = mView.key(ch, virtualKeyFromKeySym(sym), mods);
+            if (applyAction(action) || action.kind != NAMp::rack::RackAction::Kind::NoAction)
+                mDirty = true;
+            // After, not before: the key that closed the field is what releases the keyboard.
+            syncKeyboardFocus();
+            return;
+        }
+
+        case FocusOut:
+            // The focus can be taken away by the window manager at any moment. Let the flag follow
+            // reality, or a later release would hand focus somewhere it no longer is and steal it
+            // from whoever holds it now.
+            mKeyFocus = false;
+            mPrevFocus = 0;
             return;
 
         case LeaveNotify:
@@ -299,6 +439,10 @@ void RackWindow::onXEvent(const XEvent &event)
             const NAMp::rack::RackAction action = mView.mouseDown(x, y, button);
             if (applyAction(action) || action.kind != NAMp::rack::RackAction::Kind::NoAction)
                 mDirty = true;
+            // A click is what opens the name field and what dismisses it, so this is the other end
+            // of the keyboard contract: taken here when a field appeared, handed back here when one
+            // went away.
+            syncKeyboardFocus();
             return;
         }
 
@@ -404,8 +548,30 @@ bool RackWindow::applyAction(const NAMp::rack::RackAction &action)
         }
 
         case Kind::SavePreset: {
+            const std::string name = action.text.empty() ? mPresetName : action.text;
+            if (name.empty())
+                return false;
             if (mSavePreset)
-                mSavePreset(action.text.empty() ? mPresetName : action.text);
+                mSavePreset(name);
+            // Saving under a new name makes that rack the one being worked on, which is what Save
+            // As means everywhere else. Without it the list would show the new preset while the
+            // save row still offered the OLD name, so the next save would quietly go somewhere the
+            // user had just moved away from.
+            mPresetName = name;
+            mModel.setPresetName(mPresetName);
+            mDirty = true;
+            return false;
+        }
+
+        case Kind::DeletePreset: {
+            if (action.text.empty())
+                return false;
+            if (mDeletePreset)
+                mDeletePreset(action.text);
+            // The name is deliberately NOT cleared when the rack that was deleted is the one
+            // loaded. What is playing is still that rack; the file is what went. Leaving the name
+            // means the save row still offers it, so a deletion made by mistake is undone by
+            // pressing save — which is the only undo this has.
             mDirty = true;
             return false;
         }

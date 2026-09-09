@@ -73,9 +73,10 @@ struct RackAction {
         Remove,      // `section` `index`
         Add,         // `ref` into `section`
         ToggleEditor,
-        SetMix,     // `value`
-        LoadPreset, // `text` names a saved rack
-        SavePreset, // `text` names where to write the current one
+        SetMix,       // `value`
+        LoadPreset,   // `text` names a saved rack
+        SavePreset,   // `text` names where to write the current one
+        DeletePreset, // `text` names a saved rack to remove from disk
         // Discovery. The rack asks; the owner owns the catalogue and the path list, exactly as it
         // owns the filesystem for presets.
         ScanPlugins,      // rescan everything, honouring the cache
@@ -197,6 +198,37 @@ struct PickerState {
     Mode mode = Mode::Plugins;
     host::ChainSection section = host::ChainSection::Pre; // Plugins mode only
     int scroll = 0;
+};
+
+//------------------------------------------------------------------------
+// A typed name, for the one field in the rack that takes one.
+//
+// The same shape as the amp's channel rename, and deliberately so: a caret index into an ASCII
+// string, no selection, no clipboard. What that buys is that the two fields behave identically to
+// the user and that neither had to grow a text engine — and the reason ASCII is enough is the same
+// there as here, that a name outside it is set by naming the FILE, which goes through the
+// filesystem and carries whatever bytes it likes.
+//
+// `active` is also what says whether the window should be holding the keyboard. Nothing else in the
+// rack takes keys, so a field that is not open means no focus is held, which is the whole of the
+// keyboard contract the editor works under.
+struct TextEntry {
+    bool active = false;
+    std::string text;
+    size_t caret = 0;
+
+    void begin(std::string seed)
+    {
+        active = true;
+        text = std::move(seed);
+        caret = text.size();
+    }
+    void clear()
+    {
+        active = false;
+        text.clear();
+        caret = 0;
+    }
 };
 
 //------------------------------------------------------------------------
@@ -331,6 +363,33 @@ public:
         return mPresetName;
     }
 
+    // The preset overlay's name field. Open only while the overlay is, and closed by every exit
+    // from it — see RackView::commitPresetName.
+    TextEntry &presetEntry()
+    {
+        return mPresetEntry;
+    }
+    const TextEntry &presetEntry() const
+    {
+        return mPresetEntry;
+    }
+
+    // Which preset row has its delete cross armed, as a picker row index, or -1 for none.
+    //
+    // ARMED, RATHER THAN DELETING ON THE FIRST CLICK, because this one is not like the search-path
+    // cross beside it in the same overlay. Removing a search path forgets somewhere to look and is
+    // undone by adding it back; deleting a preset unlinks a file the user built by hand, and there
+    // is no undo anywhere in this program. A second click on the same cross is the cheapest
+    // confirmation that does not need a dialog, and every other click disarms it.
+    int presetDeleteArmed() const
+    {
+        return mPresetDeleteArmed;
+    }
+    void setPresetDeleteArmed(int row)
+    {
+        mPresetDeleteArmed = row;
+    }
+
     // Where plug-ins are looked for, and what a running scan is doing. Both pushed in for the same
     // reason the presets are: the rack draws discovery, it does not perform it — which is what lets
     // the offline render drive this whole overlay with no plug-in installed.
@@ -367,6 +426,8 @@ private:
     const std::vector<std::string> *mPresets = nullptr;
     const std::vector<SearchPathRow> *mSearchPaths = nullptr;
     std::string mPresetName;
+    TextEntry mPresetEntry;
+    int mPresetDeleteArmed = -1;
     ScanState mScan;
 
     std::vector<RackNode> mNodes;

@@ -26,6 +26,10 @@
 #include "filebrowser.h"
 #include "gfx/canvas.h"
 
+// For the three values a key arrives as. The rack takes keys the same way the editor does and in
+// the same currency, so a handler cannot tell which window it is serving.
+#include "pluginterfaces/base/keycodes.h"
+
 namespace NAMp::rack
 {
 
@@ -61,6 +65,19 @@ public:
     RackAction mouseUp(float x, float y, int button);
     RackAction wheel(float x, float y, int delta);
 
+    // One key, in the same three values IPlugView::onKeyDown is given: an ASCII character, a
+    // VirtualKeyCodes value and a KeyModifier mask. The window decodes the platform event; nothing
+    // below this line knows what X11 is, which is the same seam the mouse already goes through.
+    //
+    // Returns an action, so Return can be the save. RackAction::Kind::NoAction means the key was
+    // NOT consumed and the window must let it through — a wrong claim here would swallow keys that
+    // belong to whatever else is listening.
+    RackAction key(Steinberg::char16 ch, Steinberg::int16 keyCode, Steinberg::int16 modifiers);
+
+    // Whether a text field is open, which is the whole of what the window needs to decide about the
+    // keyboard: it holds the focus while this is true and at no other time.
+    bool wantsKeyboard() const;
+
     HitTarget hitTest(float x, float y) const;
 
     // The folder chooser, open only while the user is adding a search path. It is the plug-in's own
@@ -81,6 +98,15 @@ private:
     void drawScanProgress(Canvas &c);
 
     RackAction pickerMouseDown(float x, float y, int button);
+
+    // Shut the overlay and cancel any open name field. See the definition for why cancel and not
+    // commit.
+    void closePicker();
+
+    // Close the preset name field, KEEPING what was typed, and return the action that saves under
+    // it — or a redraw when the trimmed name is empty and there is nothing to write. Reached only
+    // from Return.
+    RackAction commitPresetName();
     // Rows the overlay is listing right now, whichever of its three lists is up.
     int pickerRowCount() const;
     // Where this node's wet/dry track is in whichever view is up, so a drag can keep following it

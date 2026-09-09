@@ -62,6 +62,10 @@ public:
     // lets the offline render tool drive the same overlay with no disk in the picture.
     using LoadPreset = std::function<bool(const std::string &name)>;
     using SavePreset = std::function<void(const std::string &name)>;
+    // Unlink a saved rack. Separate from SavePreset rather than a flag on it, because the rack is
+    // the only thing in this program that deletes a user's file and the call that does it should be
+    // impossible to reach by accident.
+    using DeletePreset = std::function<void(const std::string &name)>;
     // Discovery, for the same reason: the rack knows what the user asked for, the standalone owns
     // the catalogue, the path list and the file they persist to. A scan runs SYNCHRONOUSLY inside
     // this call — see the note on RackWindow::onTimer — so the callback is expected to repaint this
@@ -95,10 +99,11 @@ public:
     {
         mChainChanged = std::move(callback);
     }
-    void setPresetHandlers(LoadPreset load, SavePreset save)
+    void setPresetHandlers(LoadPreset load, SavePreset save, DeletePreset remove)
     {
         mLoadPreset = std::move(load);
         mSavePreset = std::move(save);
+        mDeletePreset = std::move(remove);
     }
     void setDiscoveryHandlers(ScanPlugins scan, EditSearchPath add, EditSearchPath remove)
     {
@@ -199,6 +204,19 @@ private:
     void redraw();
     bool resizeSurfaces(int w, int h);
 
+    // Hold the keyboard while, and only while, the rack has a text field open.
+    //
+    // The same contract the editor works under and for the same reason. Selecting KeyPressMask on
+    // this window costs nothing on its own — X delivers a key here only while this window holds the
+    // input focus — so everything rests on the focus being taken around an open field and handed
+    // straight back. Outside that, the rack claims no keys at all and whatever else is listening is
+    // untouched. Never a grab: a focus request the window manager declines simply leaves the field
+    // untyped, which is a field that does not work rather than a desktop that does not.
+    void setKeyboardFocus(bool wanted);
+    // Take or release the focus to match whether a field is open. Called after anything that could
+    // have opened or closed one, so there is no path that leaves the focus held by a shut field.
+    void syncKeyboardFocus();
+
     EventLoop &mLoop;
     NAMp::host::ChainBuilder &mBuilder;
     FontStack mFonts;
@@ -210,6 +228,7 @@ private:
     ChainChanged mChainChanged;
     LoadPreset mLoadPreset;
     SavePreset mSavePreset;
+    DeletePreset mDeletePreset;
     ScanPlugins mScanPlugins;
     EditSearchPath mAddSearchPath;
     EditSearchPath mRemoveSearchPath;
@@ -220,6 +239,12 @@ private:
     cairo_surface_t *mBuffer = nullptr; // composed here, then blitted in one operation
     int mWidth = 0, mHeight = 0;
     double mScale = 1.0;
+
+    // Focus bookkeeping. mPrevFocus is whoever held it when the field opened, so it can be given
+    // back rather than dropped on the root window.
+    bool mKeyFocus = false;
+    ::Window mPrevFocus = 0;
+    int mPrevRevert = RevertToParent;
     bool mDirty = true;
     bool mScanPending = false;
 };

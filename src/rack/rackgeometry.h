@@ -221,9 +221,14 @@ constexpr float kPickerW = kRackW - 2.0f * kPickerX;
 constexpr float kPickerH = kRackH - 2.0f * kPickerY;
 constexpr float kPickerHeaderH = 34.0f;
 constexpr float kPickerRowH = 22.0f;
-// The preset overlay reuses the picker's box and rows; its first row is "save", not a preset, so
-// the list below it is offset by one row.
+// The preset overlay reuses the picker's box and rows, with two action rows above the list: save
+// over the rack that is loaded, then save a new one under a name typed into the row. TWO rows and
+// not one, because a single row that did both could only say so in a hint - and the hint it had
+// ("click to rename") described the wrong operation, which is a fair reading of a row whose label
+// names an existing preset. A row that says "New preset" is the feature; a hint is not.
 constexpr int kPresetSaveRow = 0;
+constexpr int kPresetNewRow = 1;
+constexpr int kPresetFirstRow = 2;
 
 // The search-path overlay reuses it too, with two action rows above the list: scan, then add. Both
 // are rows rather than floating buttons for the reason the save row is — the box already scrolls,
@@ -233,6 +238,14 @@ constexpr int kPathAddRow = 1;
 constexpr int kPathFirstRow = 2;
 // The remove cross on a user row, measured from the row's right edge.
 constexpr float kPathRemoveDX = 20.0f;
+
+// The delete control on a saved-preset row: the WORD, not a cross. A cross is the right glyph for
+// forgetting a search path, which is what the row above uses it for, but deleting a preset unlinks
+// a file the user built and there is no undo anywhere in this program — so it says what it does.
+// One box, used by the painter and by the hit test, so the label and its target cannot drift apart;
+// rackrender asserts the words fit inside it.
+constexpr float kPresetDeleteW = 46.0f;
+constexpr float kPresetDeleteDX = 12.0f; // from the row's right edge to the box's right edge
 
 // The folder browser opens in exactly the picker's box (see RackView::browserBounds): the box is
 // already the overlay, and a second overlay of a different size reads as a different application.

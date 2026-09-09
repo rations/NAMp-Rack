@@ -306,6 +306,13 @@ Rect pathRowRemoveBox(const Rect &row)
     return Rect(row.right() - kPathRemoveDX, row.centerY() - 5.0f, 10.0f, 10.0f);
 }
 
+// The delete control on a saved-preset row. A word rather than a cross — see kPresetDeleteW.
+Rect presetRowRemoveBox(const Rect &row)
+{
+    return Rect(row.right() - kPresetDeleteDX - kPresetDeleteW, row.centerY() - 7.0f,
+                kPresetDeleteW, 14.0f);
+}
+
 // The folder browser fills the picker's box exactly — see rackgeometry.h.
 Rect browserBounds()
 {
@@ -1008,7 +1015,7 @@ void RackView::drawPicker(Canvas &c)
                 c.setFontSize(kLabelSize - 1.0f);
                 c.setColor(hot ? geo::kAccentBright : geo::kAccent);
                 const std::string label =
-                    "Save this rack as \"" +
+                    "Save changes to \"" +
                     (mModel->presetName().empty() ? std::string("default") : mModel->presetName()) +
                     "\"";
                 c.drawString(c.clipToWidth(label, kPickerW - 40.0f).c_str(), row.x + 12.0f,
@@ -1016,11 +1023,55 @@ void RackView::drawPicker(Canvas &c)
                 continue;
             }
 
-            const size_t which = static_cast<size_t>(index - 1);
-            if (!saved || which >= saved->size())
+            if (index == kPresetNewRow) {
+                const TextEntry &entry = mModel->presetEntry();
+                if (entry.active) {
+                    // A field, drawn like the amp's rename field: the text, and a caret that is a
+                    // rule at the width of what precedes it. No selection and no scrolling — a
+                    // preset name that outruns the row is longer than anything worth naming, and
+                    // clipToWidth keeps it inside the box either way.
+                    c.setFontSize(kSmallSize);
+                    c.setColor(kOffColor);
+                    c.drawString("NEW", row.x + 12.0f, row.centerY() + 3.5f);
+                    c.setFontSize(kLabelSize - 1.0f);
+
+                    const float textX = row.x + 52.0f;
+                    const float textW = kPickerW - 80.0f;
+                    c.setColor(geo::kTextColor);
+                    const std::string shown = c.clipToWidth(entry.text, textW);
+                    c.drawString(shown.c_str(), textX, row.centerY() + 3.5f);
+
+                    const std::string upToCaret = c.clipToWidth(
+                        entry.text.substr(0, std::min(entry.caret, entry.text.size())), textW);
+                    const float caretX = textX + c.stringWidth(upToCaret.c_str());
+                    c.setColor(geo::kAccent);
+                    c.fillRect(Rect(caretX, row.centerY() - 7.0f, 1.0f, 14.0f));
+
+                    c.setFontSize(kSmallSize);
+                    c.setColor(kOffColor);
+                    const char *hint = "Return saves - Esc cancels";
+                    c.drawString(hint, row.right() - c.stringWidth(hint) - 12.0f,
+                                 row.centerY() + 3.5f);
+                    continue;
+                }
+                c.setFontSize(kLabelSize - 1.0f);
+                c.setColor(hot ? geo::kAccentBright : geo::kAccent);
+                c.drawString("+  New preset...", row.x + 12.0f, row.centerY() + 3.5f);
+
+                c.setFontSize(kSmallSize);
+                c.setColor(kOffColor);
+                const char *hint = "click, then type a name";
+                c.drawString(hint, row.right() - c.stringWidth(hint) - 12.0f, row.centerY() + 3.5f);
+                continue;
+            }
+
+            const size_t which = static_cast<size_t>(index - kPresetFirstRow);
+            if (!saved || index < kPresetFirstRow || which >= saved->size())
                 continue;
             const std::string &name = (*saved)[which];
             const bool current = (name == mModel->presetName());
+
+            const bool armed = mModel->presetDeleteArmed() == index;
 
             c.setFontSize(kSmallSize);
             c.setColor(current ? geo::kAccent : kPanelBorder);
@@ -1028,8 +1079,22 @@ void RackView::drawPicker(Canvas &c)
 
             c.setFontSize(kLabelSize - 1.0f);
             c.setColor(hot ? geo::kTextColor : 0xD8D4D0);
-            c.drawString(c.clipToWidth(name, kPickerW - 80.0f).c_str(), row.x + 52.0f,
+            c.drawString(c.clipToWidth(name, kPickerW - 140.0f).c_str(), row.x + 52.0f,
                          row.centerY() + 3.5f);
+
+            const bool overDelete = mModel->hover().part == HitTarget::Part::PickerRowRemove &&
+                                    mModel->hover().slot == index;
+            const Rect deleteBox = presetRowRemoveBox(row);
+
+            // An armed row says so in words. A control that had only changed colour would not be a
+            // confirmation, and this is the one click in the rack that destroys something on disk.
+            c.setFontSize(kSmallSize);
+            c.setColor((armed || overDelete) ? kDangerColor : kIconColor);
+            c.drawString(armed ? "Delete?" : "Delete", deleteBox.x, row.centerY() + 3.5f);
+            if (armed) {
+                const char *ask = "click again";
+                c.drawString(ask, deleteBox.x - c.stringWidth(ask) - 10.0f, row.centerY() + 3.5f);
+            }
             continue;
         }
 
@@ -1058,11 +1123,11 @@ void RackView::drawPicker(Canvas &c)
     }
     c.popClip();
 
-    if (presets && total == 1) {
+    if (presets && total == kPresetFirstRow) {
         c.setFontSize(kLabelSize);
         c.setColor(kOffColor);
         c.drawString("No racks saved yet.", kPickerX + 14.0f,
-                     kPickerY + kPickerHeaderH + kPickerRowH + 22.0f);
+                     kPickerY + kPickerHeaderH + kPresetFirstRow * kPickerRowH + 22.0f);
     }
 
     if (total > rows) {
@@ -1152,7 +1217,7 @@ int RackView::pickerRowCount() const
         return 0;
     if (mModel->picker().mode == PickerState::Mode::Presets) {
         const std::vector<std::string> *presets = mModel->presets();
-        return 1 + (presets ? static_cast<int>(presets->size()) : 0);
+        return kPresetFirstRow + (presets ? static_cast<int>(presets->size()) : 0);
     }
     if (mModel->picker().mode == PickerState::Mode::Paths) {
         const std::vector<SearchPathRow> *paths = mModel->searchPaths();
@@ -1180,6 +1245,7 @@ HitTarget RackView::hitTest(float x, float y) const
         const int maxScroll = std::max(0, total - rows);
         const int scroll = std::min(mModel->picker().scroll, maxScroll);
         const bool paths = mModel->picker().mode == PickerState::Mode::Paths;
+        const bool presets = mModel->picker().mode == PickerState::Mode::Presets;
         const std::vector<SearchPathRow> *searchPaths = mModel->searchPaths();
         for (int i = 0; i < rows; ++i) {
             const int index = scroll + i;
@@ -1195,6 +1261,19 @@ HitTarget RackView::hitTest(float x, float y) const
                 const size_t which = static_cast<size_t>(index - kPathFirstRow);
                 if (which < searchPaths->size() && !(*searchPaths)[which].automatic &&
                     pathRowRemoveBox(row).inset(-6.0f).contains(x, y)) {
+                    hit.part = HitTarget::Part::PickerRowRemove;
+                    hit.slot = index;
+                    return hit;
+                }
+            }
+
+            // Same for a saved preset, and every one of them has a cross: unlike a search path,
+            // there is no such thing as a preset the program put there itself.
+            if (presets && index >= kPresetFirstRow) {
+                const std::vector<std::string> *saved = mModel->presets();
+                const size_t which = static_cast<size_t>(index - kPresetFirstRow);
+                if (saved && which < saved->size() &&
+                    presetRowRemoveBox(row).inset(-6.0f).contains(x, y)) {
                     hit.part = HitTarget::Part::PickerRowRemove;
                     hit.slot = index;
                     return hit;
@@ -1609,6 +1688,11 @@ RackAction RackView::mouseUp(float x, float y, int button)
         }
         case HitTarget::Part::Presets: {
             PickerState &picker = mModel->picker();
+            // Opened fresh every time: a field left over from a previous visit would be holding the
+            // keyboard for a box the user is not looking at, and an arm left over would be a
+            // confirmation the user never started.
+            mModel->presetEntry().clear();
+            mModel->setPresetDeleteArmed(-1);
             picker.open = true;
             picker.scroll = 0;
             picker.mode = PickerState::Mode::Presets;
@@ -1662,28 +1746,174 @@ RackAction RackView::mouseUp(float x, float y, int button)
 }
 
 //------------------------------------------------------------------------
+// The longest name this field will take. The same limit the amp's rename uses, and for the same
+// reason: it is a name, not a note, and the row it is drawn in is one row wide.
+constexpr size_t kPresetNameMaxChars = 64;
+
+//------------------------------------------------------------------------
+// Shut the overlay, and with it the name field.
+//
+// The field is CANCELLED rather than committed, which is where this parts company with the amp's
+// channel rename that it is otherwise a copy of. There, a click elsewhere keeps what was typed,
+// because renaming a channel costs nothing and is undone by typing again. Here the commit WRITES A
+// FILE, and a preset appearing on disk because someone clicked past a box they had started typing
+// in is a surprise with a lasting effect. Return is the save, and it is the only save.
+void RackView::closePicker()
+{
+    if (!mModel)
+        return;
+    mModel->presetEntry().clear();
+    mModel->setPresetDeleteArmed(-1);
+    mModel->picker().open = false;
+}
+
+//------------------------------------------------------------------------
+bool RackView::wantsKeyboard() const
+{
+    return mModel && mModel->presetEntry().active;
+}
+
+//------------------------------------------------------------------------
+RackAction RackView::commitPresetName()
+{
+    if (!mModel || !mModel->presetEntry().active)
+        return RackAction::redraw();
+
+    std::string name = mModel->presetEntry().text;
+    mModel->presetEntry().clear();
+
+    // Trailing spaces are a typo, not a name, and a file called "lead " beside one called "lead" is
+    // two presets the user cannot tell apart in a list.
+    while (!name.empty() && name.back() == ' ')
+        name.pop_back();
+    while (!name.empty() && name.front() == ' ')
+        name.erase(name.begin());
+    if (name.empty())
+        return RackAction::redraw();
+
+    RackAction action;
+    action.kind = RackAction::Kind::SavePreset;
+    action.text = name;
+    mModel->picker().open = false;
+    return action;
+}
+
+//------------------------------------------------------------------------
+// One key. Ported from the amp's channel-rename handler, which is the field this one is modelled
+// on, and it keeps that handler's two hard-won rules.
+//
+// FIRST: claiming a key that was not handled is worse than missing one. The rack is a child window
+// in a standalone rather than a view in a DAW, so there is no transport to swallow here today — but
+// the rule is the editor's and the two fields are meant to behave identically, and a NoAction
+// return is what lets a key travel on.
+//
+// SECOND: shift is part of typing, not a command. kShiftKey is set for every capital and for most
+// punctuation, so refusing any modifier at all makes "Lead" untypeable while "lead" is fine. Only
+// the three command modifiers are refused.
+RackAction RackView::key(Steinberg::char16 ch, Steinberg::int16 keyCode, Steinberg::int16 modifiers)
+{
+    if (!mModel || !mModel->presetEntry().active)
+        return RackAction();
+
+    TextEntry &entry = mModel->presetEntry();
+
+    switch (keyCode) {
+        case Steinberg::KEY_RETURN:
+        case Steinberg::KEY_ENTER:
+            return commitPresetName();
+        case Steinberg::KEY_ESCAPE:
+            entry.clear();
+            return RackAction::redraw();
+        case Steinberg::KEY_BACK:
+            if (entry.caret > 0)
+                entry.text.erase(--entry.caret, 1);
+            return RackAction::redraw();
+        case Steinberg::KEY_DELETE:
+            if (entry.caret < entry.text.size())
+                entry.text.erase(entry.caret, 1);
+            return RackAction::redraw();
+        case Steinberg::KEY_LEFT:
+            if (entry.caret > 0)
+                --entry.caret;
+            return RackAction::redraw();
+        case Steinberg::KEY_RIGHT:
+            if (entry.caret < entry.text.size())
+                ++entry.caret;
+            return RackAction::redraw();
+        case Steinberg::KEY_HOME:
+            entry.caret = 0;
+            return RackAction::redraw();
+        case Steinberg::KEY_END:
+            entry.caret = entry.text.size();
+            return RackAction::redraw();
+        default:
+            break;
+    }
+
+    const Steinberg::int16 kCommandMods = static_cast<Steinberg::int16>(
+        Steinberg::kAlternateKey | Steinberg::kCommandKey | Steinberg::kControlKey);
+    if ((modifiers & kCommandMods) != 0)
+        return RackAction();
+
+    // A preset name becomes a FILE name, so the characters a path cannot carry are refused here
+    // rather than mangled later: a name with a slash in it would be written to a directory that
+    // does not exist and reported as a save that failed for no visible reason.
+    if (ch < 0x20 || ch > 0x7E)
+        return RackAction();
+    if (ch == '/' || ch == '\\' || ch == ':')
+        return RackAction::redraw(); // consumed, deliberately does nothing
+    if (entry.text.size() >= kPresetNameMaxChars)
+        return RackAction::redraw(); // consumed, but the field is full
+
+    entry.text.insert(entry.caret, 1, static_cast<char>(ch));
+    ++entry.caret;
+    return RackAction::redraw();
+}
+
+//------------------------------------------------------------------------
 RackAction RackView::pickerMouseDown(float x, float y, int button)
 {
     RackAction action;
     PickerState &picker = mModel->picker();
 
     if (button != 1) {
-        picker.open = false;
+        closePicker();
         return RackAction::redraw();
     }
 
     // Anywhere outside the card dismisses, as the file browser does.
     if (!Rect(kPickerX, kPickerY, kPickerW, kPickerH).contains(x, y)) {
-        picker.open = false;
+        closePicker();
         return RackAction::redraw();
     }
 
     const HitTarget hit = hitTest(x, y);
     if (hit.part == HitTarget::Part::PickerClose) {
-        picker.open = false;
+        closePicker();
         return RackAction::redraw();
     }
     if (hit.part == HitTarget::Part::PickerRowRemove) {
+        if (picker.mode == PickerState::Mode::Presets) {
+            const std::vector<std::string> *saved = mModel->presets();
+            const size_t which = static_cast<size_t>(hit.slot - kPresetFirstRow);
+            if (!saved || hit.slot < kPresetFirstRow || which >= saved->size())
+                return RackAction::redraw();
+
+            // First click arms this row; a second on the SAME row is the confirmation. Arming a
+            // different row moves the arm rather than deleting two things.
+            if (mModel->presetDeleteArmed() != hit.slot) {
+                mModel->setPresetDeleteArmed(hit.slot);
+                mModel->presetEntry().clear();
+                return RackAction::redraw();
+            }
+            mModel->setPresetDeleteArmed(-1);
+            action.kind = RackAction::Kind::DeletePreset;
+            action.text = (*saved)[which];
+            // The overlay stays up, for the same reason the search-path one does: tidying up a
+            // preset list is usually more than one deletion.
+            return action;
+        }
+
         const std::vector<SearchPathRow> *searchPaths = mModel->searchPaths();
         const size_t which = static_cast<size_t>(hit.slot - kPathFirstRow);
         if (searchPaths && hit.slot >= kPathFirstRow && which < searchPaths->size()) {
@@ -1695,6 +1925,11 @@ RackAction RackView::pickerMouseDown(float x, float y, int button)
         }
         return RackAction::redraw();
     }
+
+    // Anything below this line is not the armed cross, so the arm goes. A confirmation that
+    // survived the user looking elsewhere would eventually fire on a click they had forgotten
+    // they were halfway through.
+    mModel->setPresetDeleteArmed(-1);
 
     if (hit.part == HitTarget::Part::PickerRow) {
         if (picker.mode == PickerState::Mode::Paths) {
@@ -1717,17 +1952,32 @@ RackAction RackView::pickerMouseDown(float x, float y, int button)
 
         if (picker.mode == PickerState::Mode::Presets) {
             if (hit.slot == kPresetSaveRow) {
+                // Overwrite the rack that is loaded. This is what the row has always done and it
+                // stays one click.
+                mModel->presetEntry().clear();
                 action.kind = RackAction::Kind::SavePreset;
                 action.text = mModel->presetName();
-                picker.open = false;
+                closePicker();
                 return action;
             }
+            if (hit.slot == kPresetNewRow) {
+                // Opens the field EMPTY. Seeding it with the loaded rack's name would make the
+                // obvious keystroke — click, press Return — overwrite the preset the user is on,
+                // from a row that says New.
+                mModel->presetEntry().begin(std::string());
+                return RackAction::redraw();
+            }
+            // Clicking a saved rack while the field is open LOADS it and abandons what was
+            // typed. The alternative — saving first — would make one click do two filesystem
+            // things, only one of which was asked for.
+            mModel->presetEntry().clear();
+
             const std::vector<std::string> *saved = mModel->presets();
-            const size_t which = static_cast<size_t>(hit.slot - 1);
-            if (saved && hit.slot > 0 && which < saved->size()) {
+            const size_t which = static_cast<size_t>(hit.slot - kPresetFirstRow);
+            if (saved && hit.slot >= kPresetFirstRow && which < saved->size()) {
                 action.kind = RackAction::Kind::LoadPreset;
                 action.text = (*saved)[which];
-                picker.open = false;
+                closePicker();
                 return action;
             }
             return RackAction::redraw();
@@ -1738,7 +1988,7 @@ RackAction RackView::pickerMouseDown(float x, float y, int button)
             action.kind = RackAction::Kind::Add;
             action.section = picker.section;
             action.ref = (*catalog)[static_cast<size_t>(hit.slot)].ref;
-            picker.open = false;
+            closePicker();
             return action;
         }
     }

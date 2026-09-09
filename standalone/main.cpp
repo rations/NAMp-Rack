@@ -1467,6 +1467,27 @@ int main(int argc, char **argv)
         refreshRackList();
     };
 
+    auto deleteRackNamed = [&](const std::string &name) {
+        const std::string path = NAMp::host::rackPath(name);
+        if (path.empty()) {
+            fprintf(stderr, "namp-rack: '%s' is not a usable rack name\n", name.c_str());
+            return;
+        }
+        // The preset and the directory of state files beside it. remove_all on the directory
+        // because a node's state may have copied whole files into it; the error_code overloads
+        // because a preset that is already gone is not a failure worth reporting.
+        std::error_code ec;
+        const bool had = std::filesystem::remove(path, ec);
+        std::filesystem::remove_all(NAMp::host::rackStateDir(path), ec);
+        if (!had) {
+            fprintf(stderr, "namp-rack: cannot delete the rack '%s': %s\n", name.c_str(),
+                    ec ? ec.message().c_str() : "no such rack");
+            return;
+        }
+        printf("namp-rack: deleted the rack %s\n", path.c_str());
+        refreshRackList();
+    };
+
     // A scan is synchronous and can take seconds when a bundle has changed, so it draws its own
     // progress: the callback paints and blits the strip directly, because the run loop is inside
     // the scan and will not tick again until it returns.
@@ -1511,7 +1532,7 @@ int main(int argc, char **argv)
 
     rack.setEditorToggle(toggleEditorFor);
     rack.setEditorClose(closeEditorFor);
-    rack.setPresetHandlers(loadRackNamed, saveRackAs);
+    rack.setPresetHandlers(loadRackNamed, saveRackAs, deleteRackNamed);
     rack.setDiscoveryHandlers(scanPlugins, addSearchPath, removeSearchPath);
     rack.setChainChanged([&audio]() { audio.notifyLatencyChanged(); });
     rack.refreshModel();

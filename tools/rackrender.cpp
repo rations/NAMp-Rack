@@ -373,6 +373,7 @@ bool applyAction(host::ChainBuilder &builder, RackModel &model, const RackAction
         case RackAction::Kind::ToggleEditor:
         case RackAction::Kind::LoadPreset:
         case RackAction::Kind::SavePreset:
+        case RackAction::Kind::DeletePreset:
         // Discovery: the standalone scans, edits the path list and writes it here. None of it
         // touches the chain, which is exactly why the overlay can be exercised offline.
         case RackAction::Kind::ScanPlugins:
@@ -455,6 +456,16 @@ void auditLayout(RackView &view, RackModel &model, const FontStack &fonts)
         const float anchorW = measure.stringWidth("NAMp");
         check(anchorW + 10.0f <= rackgeo::kAnchorSubtitleDX,
               "the NAMp wordmark clears the anchor row's subtitle");
+
+        // The preset row's delete control is a WORD in a fixed box, and the painter and the hit
+        // test share that box — so a label wider than it would be a control wider than its target,
+        // which is the failure mode a glyph cannot have.
+        measure.setFont(Font::Body);
+        measure.setFontSize(rackgeo::kSmallSize);
+        check(measure.stringWidth("Delete") <= rackgeo::kPresetDeleteW &&
+                  measure.stringWidth("Delete?") <= rackgeo::kPresetDeleteW,
+              "both Delete labels fit the box they are hit-tested in");
+        measure.setFont(Font::Title);
 
         // Same reasoning for the slider's end labels: kMixLabelW is the space reserved for them on
         // either side of the track, and a label wider than its reserve runs into the name column on
@@ -795,17 +806,134 @@ void auditInteraction(host::ChainBuilder &builder, RackView &view, RackModel &mo
               "the save row hit-tests");
         action = view.mouseDown(rackgeo::kPickerX + 40.0f, row0, 1);
         check(action.kind == RackAction::Kind::SavePreset && action.text == "crunch",
-              "clicking it asks to save over the rack that is loaded");
+              "the save row overwrites the rack that is loaded, in one click");
         check(!model.picker().open, "and closes the overlay");
+        check(!model.presetEntry().active, "with no field involved");
+
+        // Row 1 is the one that makes a SECOND preset. It is its own row rather than a hint on the
+        // row above, because a row labelled with an existing preset's name cannot also advertise
+        // making a new one — the first attempt said "click to rename" there and read, correctly, as
+        // renaming that preset.
+        click(view, rackgeo::kPresetsX + 20.0f, rackgeo::kPresetsY + rackgeo::kToggleH * 0.5f);
+        const float rowNew = row0 + rackgeo::kPickerRowH;
+        view.mouseMove(rackgeo::kPickerX + 40.0f, rowNew);
+        check(model.hover().part == HitTarget::Part::PickerRow &&
+                  model.hover().slot == rackgeo::kPresetNewRow,
+              "the new-preset row hit-tests");
+        action = view.mouseDown(rackgeo::kPickerX + 40.0f, rowNew, 1);
+        check(action.kind == RackAction::Kind::Redraw, "clicking it saves nothing yet");
+        check(model.presetEntry().active, "it opens the name field");
+        check(model.presetEntry().text.empty(),
+              "EMPTY, so click-then-Return cannot overwrite the preset the user is on");
+        check(model.picker().open, "and the overlay stays up to be typed into");
+        check(view.wantsKeyboard(), "the window is told to take the keyboard");
+
+        // Typing. Two ordinary characters and a backspace, which is the whole of what the field
+        // has to do; the SDK's key values are what a real key press arrives as.
+        auto type = [&view](char c) { return view.key(static_cast<Steinberg::char16>(c), 0, 0); };
+        for (const char c : std::string("XY"))
+            type(c);
+        check(model.presetEntry().text == "XY", "typed characters land at the caret");
+        view.key(0, Steinberg::KEY_BACK, 0);
+        check(model.presetEntry().text == "X", "backspace removes one");
+
+        // A path separator would be a save into a directory that does not exist, reported as a
+        // failure with no visible cause, so the field refuses it rather than passing it on.
+        type('/');
+        check(model.presetEntry().text == "X", "a slash is refused, not inserted");
+
+        // Escape abandons it, and abandoning must not write anything.
+        action = view.key(0, Steinberg::KEY_ESCAPE, 0);
+        check(action.kind == RackAction::Kind::Redraw && !model.presetEntry().active,
+              "escape closes the field");
+        check(!view.wantsKeyboard(), "and gives the keyboard back");
+
+        // Now the real thing: open, type a NAME THAT IS NOT THE LOADED ONE, and press Return.
+        // This is the whole feature — before it there was no way to produce a second preset.
+        view.mouseDown(rackgeo::kPickerX + 40.0f, rowNew, 1);
+        for (const char c : std::string(" lead tone "))
+            type(c);
+        action = view.key(0, Steinberg::KEY_RETURN, 0);
+        check(action.kind == RackAction::Kind::SavePreset, "return saves");
+        check(action.text == "lead tone", "under the typed name, trimmed at both ends");
+        check(!model.picker().open, "and closes the overlay");
+        check(!model.presetEntry().active && !view.wantsKeyboard(),
+              "leaving no field open and no keyboard held");
+
+        // A field that is open and then dismissed by clicking away must NOT write a file: the
+        // commit here has a lasting effect, unlike the channel rename this field is modelled on.
+        click(view, rackgeo::kPresetsX + 20.0f, rackgeo::kPresetsY + rackgeo::kToggleH * 0.5f);
+        view.mouseDown(rackgeo::kPickerX + 40.0f, rowNew, 1);
+        check(model.presetEntry().active, "the field is open again");
+        action = view.mouseDown(4.0f, static_cast<float>(rackgeo::kRackH) - 4.0f, 1);
+        check(action.kind != RackAction::Kind::SavePreset,
+              "clicking outside the overlay does not save what was typed");
+        check(!model.presetEntry().active && !view.wantsKeyboard(), "it just closes the field");
+
+        // A name that is only spaces is not a file name.
+        click(view, rackgeo::kPresetsX + 20.0f, rackgeo::kPresetsY + rackgeo::kToggleH * 0.5f);
+        view.mouseDown(rackgeo::kPickerX + 40.0f, rowNew, 1);
+        model.presetEntry().text = "   ";
+        model.presetEntry().caret = 3;
+        action = view.key(0, Steinberg::KEY_RETURN, 0);
+        check(action.kind != RackAction::Kind::SavePreset, "an all-space name saves nothing");
+
+        model.picker().open = true;
+        model.picker().mode = PickerState::Mode::Presets;
+        model.picker().scroll = 0;
 
         // Row 1 is the first saved rack.
         model.picker().open = true;
         model.picker().mode = PickerState::Mode::Presets;
         model.picker().scroll = 0;
-        const float row1 = row0 + rackgeo::kPickerRowH;
+        const float row1 = row0 + rackgeo::kPresetFirstRow * rackgeo::kPickerRowH;
         action = view.mouseDown(rackgeo::kPickerX + 40.0f, row1, 1);
         check(action.kind == RackAction::Kind::LoadPreset && action.text == "clean",
-              "the row below it loads the first saved rack, not the second");
+              "the first row under the two action rows loads the first saved rack, not the second");
+
+        // Deleting. Two clicks, and the first one must not delete anything.
+        model.picker().open = true;
+        model.picker().mode = PickerState::Mode::Presets;
+        model.picker().scroll = 0;
+        const float deleteX = rackgeo::kPickerX + rackgeo::kPickerW - rackgeo::kPresetDeleteDX -
+                              rackgeo::kPresetDeleteW * 0.5f;
+        view.mouseMove(deleteX, row1);
+        check(model.hover().part == HitTarget::Part::PickerRowRemove &&
+                  model.hover().slot == rackgeo::kPresetFirstRow,
+              "the Delete label hit-tests as its row's remove control");
+
+        action = view.mouseDown(deleteX, row1, 1);
+        check(action.kind != RackAction::Kind::DeletePreset, "the first click deletes nothing");
+        check(model.presetDeleteArmed() == rackgeo::kPresetFirstRow, "it arms that row");
+        check(model.picker().open, "and leaves the overlay up to be confirmed in");
+
+        action = view.mouseDown(deleteX, row1, 1);
+        check(action.kind == RackAction::Kind::DeletePreset && action.text == "clean",
+              "the second click on the same row deletes it, by name");
+        check(model.presetDeleteArmed() < 0, "and disarms");
+        check(model.picker().open, "the overlay stays up for the next one");
+
+        // An arm must not survive a click elsewhere, or it fires on a click the user has
+        // forgotten they were halfway through.
+        view.mouseDown(deleteX, row1, 1);
+        check(model.presetDeleteArmed() == rackgeo::kPresetFirstRow, "armed again");
+        view.mouseDown(rackgeo::kPickerX + 40.0f, row0, 1);
+        check(model.presetDeleteArmed() < 0, "a click on another row disarms it");
+
+        // Arming a DIFFERENT row moves the arm rather than deleting two presets.
+        model.picker().open = true;
+        model.picker().mode = PickerState::Mode::Presets;
+        const float row2 = row1 + rackgeo::kPickerRowH;
+        view.mouseDown(deleteX, row1, 1);
+        action = view.mouseDown(deleteX, row2, 1);
+        check(action.kind != RackAction::Kind::DeletePreset,
+              "arming one row then clicking another deletes nothing");
+        check(model.presetDeleteArmed() == rackgeo::kPresetFirstRow + 1, "the arm moved");
+
+        model.picker().open = false;
+        model.setPresetDeleteArmed(-1);
+        model.picker().open = true;
+        model.picker().mode = PickerState::Mode::Presets;
         model.picker().open = false;
 
         model.setPresets(nullptr);
@@ -1293,9 +1421,27 @@ int main(int argc, char **argv)
 
     model.setPresets(&demoRacks);
     model.setPresetName("crunch");
+    // open = true was MISSING here, so this picture has been rendering the plain list all along and
+    // the overlay it is named after has never been in it. Found by looking at the file while adding
+    // the name field, which is the whole reason these renders exist.
+    model.picker().open = true;
     model.picker().mode = PickerState::Mode::Presets;
     model.picker().scroll = 0;
     ok = renderTo(prefix + "-presets.png", view, model, fonts, scale) && ok;
+
+    // ...and again with the name field open, because a caret and a half-typed name are the parts
+    // that cannot be reviewed from the row's resting state.
+    model.presetEntry().begin("lead tone");
+    model.presetEntry().caret = 4;
+    ok = renderTo(prefix + "-preset-name.png", view, model, fonts, scale) && ok;
+    model.presetEntry().clear();
+
+    // ...and with a row armed for deletion, which is the state that has to read as a question
+    // rather than as a control that has merely changed colour.
+    model.setPresetDeleteArmed(rackgeo::kPresetFirstRow + 1);
+    ok = renderTo(prefix + "-preset-delete.png", view, model, fonts, scale) && ok;
+    model.setPresetDeleteArmed(-1);
+
     model.picker().open = false;
     model.setPresets(nullptr);
     model.setPresetName(std::string());
