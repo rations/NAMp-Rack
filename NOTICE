@@ -221,8 +221,9 @@ scripts/build-win-deps.sh pins:
 
   The LV2 stack is NOT part of the Windows build. Windows hosts VST3 only, so
   lilv, suil, serd, sord, sratom and zix are absent from that build entirely —
-  see the LV2 build switch in CMakeLists.txt. Nor is JACK: Windows audio is
-  WASAPI, which is part of the operating system.
+  see the LV2 build switch in CMakeLists.txt. Nor is JACK: Windows audio is ASIO
+  with WASAPI as the fallback, and WinMM for MIDI. WASAPI and WinMM are part of
+  the operating system; ASIO is a Steinberg SDK and has its own section below.
 
   fontconfig is NOT part of the Windows build either. It is linked on Linux but
   never called — there is no Fc* call anywhere in this tree — and FreeType opens
@@ -249,6 +250,46 @@ scripts/build-win-deps.sh pins:
   rebuilds from that source with one cmake invocation. Anyone may substitute their
   own cairo and rebuild. If cairo's LGPL terms are ever inconvenient, its MPL 1.1
   arm is available instead — no cairo source file is modified either way.
+
+-------------------------------------------------------------------------------
+
+ASIO — the Windows audio backend
+
+  Steinberg ASIO SDK 2.3.4, https://www.steinberg.net/developers/
+
+  Copyright (c) 2025 Steinberg Media Technologies GmbH. Used under the
+  PROPRIETARY Steinberg ASIO License, under a signed licensing agreement — not
+  under the SDK's alternative GPLv3 arm, which this project cannot take because
+  no GPLv3 code may enter its include graph.
+
+  ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe
+  and other countries
+
+  That sentence is the notice the agreement requires, reproduced exactly. It also
+  appears in the product itself, on the setup page, which is what the agreement
+  asks of a product distributed as a download.
+
+  WHAT IS AND IS NOT REDISTRIBUTED. The compiled host side of the SDK is linked
+  into the Windows standalone, which is what the licence exists to permit. The SDK
+  ITSELF is not redistributed in any form: no ASIO source file or header is
+  present in this repository, and none is shipped. The build fetches it into an
+  untracked dependency sysroot (scripts/build-win-deps.sh) and reaches it from
+  nowhere else. This is a condition of the agreement rather than a preference —
+  it forbids distributing the SDK or parts of it "for the use as software
+  developer kit in any way, for example, integrated in any framework
+  application" — and both .gitignore and the project's phase gate enforce it
+  mechanically, because a breach here is not undone by a later deletion.
+
+  WINDOWS ONLY, AND OPTIONAL AT BUILD TIME. NAMPRACK_WIN_ASIO gates it; the Linux
+  build cannot reach it and no header outside the Windows audio backend includes
+  it. Building and testing this project requires no agreement with Steinberg;
+  only PUBLISHING a Windows binary that contains the ASIO backend does.
+
+  Per-file, the SDK is not uniform: its host/ and driver/ trees carry a
+  BSD-3-Clause header, while its common/ tree carries the dual proprietary/GPLv3
+  licence. The BSD half cannot stand alone — its headers include the common/ ones
+  and every host entry point is declared there — so the agreement governs either
+  way.
 
 -------------------------------------------------------------------------------
 

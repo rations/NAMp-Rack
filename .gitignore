@@ -25,6 +25,35 @@ captures/
 scancache
 pluginindex
 
+# The ASIO SDK, which must NEVER be committed here, in whole or in part.
+#
+# This is a licence condition and not tidiness. Steinberg's agreement forbids the licensee to
+# "sell, license, give-away and/or distribute the SDK or parts of it for the use as software
+# developer kit in any way, for example, integrated in any framework application, on any medium,
+# including the Internet" — so a vendored copy, a checked-in header, or a stray asio.h anywhere in
+# the working tree is a breach, and unlike most mistakes in this tree, pushing one cannot be taken
+# back by a later deletion. (The reference implementations get this wrong: RtAudio vendors an ASIO
+# snapshot in-repository and iPlug2 inherits it. It is not a precedent to follow.)
+#
+# The SDK reaches the Windows build through scripts/build-win-deps.sh and the untracked dependency
+# sysroot, and through nothing else. These names are guarded so a stray copy cannot be staged by
+# accident; the phase gate sweeps for the same names, because the ignore rule stops a copy arriving
+# and the sweep catches one that arrived another way.
+#
+# Our own backend is asiobackend.{h,cpp}, which none of these patterns matches.
+asio.h
+asio.cpp
+asiosys.h
+iasiodrv.h
+asiodrvr.h
+asiodrvr.cpp
+asiodrivers.h
+asiodrivers.cpp
+asiolist.h
+asiolist.cpp
+ASIOConvertSamples.h
+ASIOConvertSamples.cpp
+
 # Personal CMake configure presets (local reference-tree paths).
 CMakeUserPresets.json
 

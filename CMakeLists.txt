@@ -50,6 +50,28 @@ option(NAMPRACK_BUILD_PEDALS   "Build the bundled pedals from the submodule" ON)
 # proofs as the amp's only check.
 option(NAMPRACK_BUILD_VST3_BUNDLE "Build the amp as a VST3 bundle for validator coverage" ON)
 
+# ASIO is the Windows audio backend and ships by default, so this is ON rather than opt-in: it is
+# what the hardware vendors' drivers expose and what Windows guitar players actually run, and a
+# standalone that can only reach the shared-mode mixer is a worse product than the plug-in this
+# project already ships. WASAPI is the RUNTIME fallback for a machine with no vendor ASIO driver,
+# never a substitute for shipping ASIO.
+#
+# THE LICENCE IS A CONDITION ON PUBLISHING, NOT ON BUILDING. The SDK is dual-licensed and this
+# project is on the proprietary arm — the GPLv3 arm is closed, because no GPLv3 code may enter this
+# include graph. Under that arm the SDK costs nothing and is non-royalty-bearing, but it must never
+# be redistributed, which is why it reaches the build only through the untracked dependency sysroot
+# and why NOTICE carries the trademark notice the agreement fixes. Turning this OFF produces a
+# WASAPI-only standalone that needs no agreement with anyone; leaving it ON needs the countersigned
+# agreement before a binary is published, and nothing before a binary is built.
+if(WIN32)
+    option(NAMPRACK_WIN_ASIO "Host ASIO drivers in the Windows standalone (Steinberg ASIO SDK)" ON)
+else()
+    # Declared on every platform so a script may set it without a platform test, and forced off
+    # where it cannot mean anything: no header outside the Windows audio backend includes it, and
+    # the Linux build must not be able to reach it at all.
+    set(NAMPRACK_WIN_ASIO OFF)
+endif()
+
 if(NAMPRACK_BUILD_LV2_HOST AND WIN32)
     message(FATAL_ERROR
         "NAMPRACK_BUILD_LV2_HOST is ON but the target is Windows. LV2 hosting needs lilv, suil "
@@ -221,6 +243,47 @@ if(NOT WIN32)
     pkg_check_modules(NAMPRACK_GFX REQUIRED IMPORTED_TARGET
         cairo freetype2 fontconfig x11)
     pkg_check_modules(NAMPRACK_JACK REQUIRED IMPORTED_TARGET jack)
+endif()
+
+# ---------------------------------------------------------------------------
+# The ASIO SDK, from the dependency sysroot and from nowhere else.
+#
+# There is no library to find: the SDK is sources a host compiles into itself, so what is located
+# here is an include root and four translation units. NAMPRACK_ASIO_SDK_DIR can point at another
+# prefix's copy; the default is the one scripts/build-win-deps.sh installs.
+#
+# A MISSING SDK IS A LOUD CONFIGURE ERROR, never a silent WASAPI-only build. Falling back quietly
+# would produce a standalone that looks finished, runs, and cannot reach the audio interface most of
+# its users own — which is the failure this whole decision exists to prevent.
+# ---------------------------------------------------------------------------
+if(NAMPRACK_WIN_ASIO)
+    set(NAMPRACK_ASIO_SDK_DIR "${NAMPRACK_WIN_SYSROOT}/include/asiosdk"
+        CACHE PATH "The ASIO SDK's host side, as installed into the dependency sysroot")
+    set(NAMPRACK_ASIO_SOURCES
+        ${NAMPRACK_ASIO_SDK_DIR}/common/asio.cpp
+        ${NAMPRACK_ASIO_SDK_DIR}/host/asiodrivers.cpp
+        ${NAMPRACK_ASIO_SDK_DIR}/host/pc/asiolist.cpp)
+    foreach(_asio_file
+            ${NAMPRACK_ASIO_SDK_DIR}/common/asio.h
+            ${NAMPRACK_ASIO_SDK_DIR}/common/asiosys.h
+            ${NAMPRACK_ASIO_SDK_DIR}/common/iasiodrv.h
+            ${NAMPRACK_ASIO_SDK_DIR}/host/asiodrivers.h
+            ${NAMPRACK_ASIO_SDK_DIR}/host/ginclude.h
+            ${NAMPRACK_ASIO_SDK_DIR}/host/pc/asiolist.h
+            ${NAMPRACK_ASIO_SOURCES})
+        if(NOT EXISTS "${_asio_file}")
+            message(FATAL_ERROR
+                "NAMPRACK_WIN_ASIO is ON but the ASIO SDK is not in the dependency sysroot: "
+                "${_asio_file} is missing.\n"
+                "  Run scripts/build-win-deps.sh, which fetches it into that prefix and verifies "
+                "what arrived. It is never committed to this repository — Steinberg's licence "
+                "forbids redistributing the SDK — so the sysroot is the only place it can come "
+                "from.\n"
+                "  To build the Windows standalone WITHOUT ASIO support, which is a WASAPI-only "
+                "product and needs no agreement with anyone, configure with "
+                "-DNAMPRACK_WIN_ASIO=OFF.")
+        endif()
+    endforeach()
 endif()
 
 # The SDK's bundle loader, which is per-platform. Named once here rather than at each consumer:
@@ -1045,6 +1108,16 @@ if(NAMPRACK_BUILD_LV2_HOST)
                    "lilv ${LV2HOST_lilv-0_VERSION}, suil ${LV2HOST_suil-0_VERSION})")
 else()
     message(STATUS "[NAMp-Rack]   hosting         VST3 only")
+endif()
+if(WIN32)
+    if(NAMPRACK_WIN_ASIO)
+        message(STATUS "[NAMp-Rack]   audio           ASIO + WASAPI fallback, WinMM MIDI")
+    else()
+        message(STATUS "[NAMp-Rack]   audio           WASAPI only (NAMPRACK_WIN_ASIO=OFF), "
+                       "WinMM MIDI")
+    endif()
+else()
+    message(STATUS "[NAMp-Rack]   audio           JACK")
 endif()
 message(STATUS "[NAMp-Rack]   validator bundle ${NAMPRACK_BUILD_VST3_BUNDLE} (never packaged)")
 message(STATUS "[NAMp-Rack]   tools           ${NAMPRACK_BUILD_TOOLS}")
