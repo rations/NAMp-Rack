@@ -1,6 +1,6 @@
-// EventLoop implementation. See eventloop.h.
+// X11EventLoop implementation. See x11eventloop.h, and eventloop.h for the platform seam.
 
-#include "eventloop.h"
+#include "x11eventloop.h"
 
 #include <sys/select.h>
 
@@ -13,12 +13,24 @@ namespace Rations
 {
 
 //------------------------------------------------------------------------
-EventLoop::EventLoop(::Display *display) : mDisplay(display)
+X11EventLoop::X11EventLoop() : mDisplay(XOpenDisplay(nullptr))
 {
 }
 
 //------------------------------------------------------------------------
-tresult PLUGIN_API EventLoop::queryInterface(const TUID iid, void **obj)
+X11EventLoop::~X11EventLoop()
+{
+    // Every window created against this connection is destroyed before this runs: they are declared
+    // after the loop and so are torn down before it. Closing the connection first would destroy
+    // their windows underneath them.
+    if (mDisplay) {
+        XCloseDisplay(mDisplay);
+        mDisplay = nullptr;
+    }
+}
+
+//------------------------------------------------------------------------
+tresult PLUGIN_API X11EventLoop::queryInterface(const TUID iid, void **obj)
 {
     if (!obj)
         return kInvalidArgument;
@@ -38,7 +50,7 @@ tresult PLUGIN_API EventLoop::queryInterface(const TUID iid, void **obj)
 }
 
 //------------------------------------------------------------------------
-void EventLoop::addWindow(::Window window, XEventCallback callback)
+void X11EventLoop::addWindow(::Window window, XEventCallback callback)
 {
     if (!window)
         return;
@@ -52,7 +64,7 @@ void EventLoop::addWindow(::Window window, XEventCallback callback)
 }
 
 //------------------------------------------------------------------------
-void EventLoop::removeWindow(::Window window)
+void X11EventLoop::removeWindow(::Window window)
 {
     mWindows.erase(std::remove_if(mWindows.begin(), mWindows.end(),
                                   [window](const WindowEntry &e) { return e.window == window; }),
@@ -60,7 +72,7 @@ void EventLoop::removeWindow(::Window window)
 }
 
 //------------------------------------------------------------------------
-void EventLoop::dispatchX(const XEvent &event)
+void X11EventLoop::dispatchX(const XEvent &event)
 {
     // xany.window is the window the event was reported relative to, which is what every registered
     // window matched against. Copied out before the callback runs: a callback may remove windows,
@@ -79,8 +91,8 @@ void EventLoop::dispatchX(const XEvent &event)
 }
 
 //------------------------------------------------------------------------
-tresult PLUGIN_API EventLoop::registerEventHandler(Linux::IEventHandler *handler,
-                                                   Linux::FileDescriptor fd)
+tresult PLUGIN_API X11EventLoop::registerEventHandler(Linux::IEventHandler *handler,
+                                                      Linux::FileDescriptor fd)
 {
     if (!handler || fd < 0)
         return kInvalidArgument;
@@ -88,7 +100,7 @@ tresult PLUGIN_API EventLoop::registerEventHandler(Linux::IEventHandler *handler
     return kResultTrue;
 }
 
-tresult PLUGIN_API EventLoop::unregisterEventHandler(Linux::IEventHandler *handler)
+tresult PLUGIN_API X11EventLoop::unregisterEventHandler(Linux::IEventHandler *handler)
 {
     if (!handler)
         return kInvalidArgument;
@@ -101,7 +113,8 @@ tresult PLUGIN_API EventLoop::unregisterEventHandler(Linux::IEventHandler *handl
 }
 
 //------------------------------------------------------------------------
-tresult PLUGIN_API EventLoop::registerTimer(Linux::ITimerHandler *handler, Linux::TimerInterval ms)
+tresult PLUGIN_API X11EventLoop::registerTimer(Linux::ITimerHandler *handler,
+                                               Linux::TimerInterval ms)
 {
     if (!handler || ms == 0)
         return kInvalidArgument;
@@ -110,7 +123,7 @@ tresult PLUGIN_API EventLoop::registerTimer(Linux::ITimerHandler *handler, Linux
     return kResultTrue;
 }
 
-tresult PLUGIN_API EventLoop::unregisterTimer(Linux::ITimerHandler *handler)
+tresult PLUGIN_API X11EventLoop::unregisterTimer(Linux::ITimerHandler *handler)
 {
     if (!handler)
         return kInvalidArgument;
@@ -122,7 +135,7 @@ tresult PLUGIN_API EventLoop::unregisterTimer(Linux::ITimerHandler *handler)
 }
 
 //------------------------------------------------------------------------
-int EventLoop::fireDueTimersAndGetTimeout()
+int X11EventLoop::fireDueTimersAndGetTimeout()
 {
     if (mTimers.empty())
         return -1;
@@ -161,7 +174,7 @@ int EventLoop::fireDueTimersAndGetTimeout()
 }
 
 //------------------------------------------------------------------------
-void EventLoop::run()
+void X11EventLoop::run()
 {
     mRunning.store(true, std::memory_order_relaxed);
     const int xFd = mDisplay ? ConnectionNumber(mDisplay) : -1;

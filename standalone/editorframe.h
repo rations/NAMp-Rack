@@ -8,8 +8,8 @@
 // ONE PER VIEW, NOT ONE PER PROCESS. resizeView() must resize the window THIS view is embedded in,
 // and the frame is the only context the callback gets — a shared frame would have to guess which of
 // several open editors was asking. The run loop it hands back, by contrast, is deliberately the one
-// shared EventLoop: there is a single X connection and a single select() for the whole process. See
-// eventloop.h for why the two are separate objects at all.
+// shared EventLoop: there is one of those for the whole process. See eventloop.h for why the two
+// are separate objects at all, and why on Windows there is no run loop to hand out.
 //
 // THIS IS THE AMP'S FRAME SPECIFICALLY, which is why it owns a window rather than taking a resize
 // callback. A hosted plug-in's editor lives in a top-level of its own with no policy attached to
@@ -47,10 +47,9 @@
 #pragma once
 
 #include "eventloop.h"
+#include "nativewindow.h"
 
 #include "pluginterfaces/gui/iplugview.h"
-
-#include <X11/Xlib.h>
 
 #include <functional>
 
@@ -74,8 +73,9 @@ public:
 
     // The top-level window the editor was embedded into, and the view inside it. Set once, after
     // the view has attached: resizeView cannot do its job without both, and until it is called a
-    // resize request is refused rather than acted on half-way.
-    void setEmbedding(::Window window, Steinberg::IPlugView *view);
+    // resize request is refused rather than acted on half-way. The window is BORROWED — it outlives
+    // this frame, and nothing here destroys it.
+    void setEmbedding(NativeWindow &window, Steinberg::IPlugView *view);
 
     // The strip's height at a given window width, in pixels. Public because the caller has to
     // create the top-level at the right size before there is a frame to ask, and a second spelling
@@ -118,9 +118,9 @@ private:
     // is a question that has to be answerable from a user's machine rather than from this one.
     void trace(const char *fmt, ...) const;
 
-    // Resize the X window and remember the size, so the ConfigureNotify it provokes is recognised
-    // as ours rather than treated as the user dragging the frame. Both are WINDOW sizes: the strip
-    // is inside them.
+    // Resize the window and remember the size, so the resize event it provokes is recognised as
+    // ours rather than treated as the user dragging the frame. Both are WINDOW sizes: the strip is
+    // inside them.
     void applySize(int w, int h);
     // Put the strip under the editor at whatever the window is now. Harmless when there is none.
     void placeStrip();
@@ -134,7 +134,7 @@ private:
     void updateSizeHints();
 
     EventLoop &mLoop;
-    ::Window mWindow = 0;
+    NativeWindow *mWindow = nullptr;
     Steinberg::IPlugView *mView = nullptr;
     // The WINDOW size we last asked for — editor plus strip — and the editor's own height inside
     // it. The editor's width is the window's; that is the whole policy above.

@@ -1122,65 +1122,102 @@ if(NAMPRACK_BUILD_TOOLS)
 endif()
 
 # ---------------------------------------------------------------------------
-# namp-rack — the product. The amp without a DAW: one X window, its own editor embedded in it, a
-# Linux::IRunLoop the editor registers with, and an audio backend driving the processor.
+# namp-rack — the product. The amp without a DAW: one window, its own editor embedded in it, a run
+# loop the editor registers with, and an audio backend driving the processor.
 #
 # ONE FILE, NO INSTALLATION. The amp is linked in (NampRackPlugin) and its art and fonts are linked
 # in (NampRackResources), so this runs on a machine with nothing installed and can never silently
 # run an older installed build than the one just made. A bundle path can still be given on the
 # command line to drive an external build deliberately.
 #
-# NOT BUILT WITHOUT JACK, and that is a hard dependency rather than a degradation: the standalone
-# with no audio is the editor and nothing else, which is what panelrender already covers offline
-# and covers better.
+# BUILT ON BOTH PLATFORMS FROM ONE main.cpp, and that is the point of the three seams below it.
+# Everything platform-specific is behind eventloop.h (the run loop), nativewindow.h (windows) and
+# nativeaudio.h (the device); main.cpp includes those three and names no platform at all. Duplicating
+# it per platform was the alternative and was rejected: its platform-neutral half is the chain
+# builder, the preset handling, the UI tick and the feedback pump, and two copies would mean
+# implementing every later feature twice and having one of them go stale.
+#
+# NOT BUILT WITHOUT AN AUDIO BACKEND, and that is a hard dependency rather than a degradation: the
+# standalone with no audio is the editor and nothing else, which is what panelrender already covers
+# offline and covers better. On Linux that backend is JACK; on Windows it is ASIO and WASAPI, which
+# are always present because they are the operating system's.
 # ---------------------------------------------------------------------------
-if(NOT WIN32)
-    # usediids.cpp stays HERE and nowhere else: it defines the SDK's interface IIDs and must appear
-    # exactly once in a final binary. The plug-in-side classes come in through NampRackPlugin,
-    # which does not carry them.
-    add_executable(namp-rack
-        ${NAMPRACK_ROOT}/standalone/main.cpp
-        # The host-side interface IIDs, exactly once per final binary — see hostiids.cpp.
-        ${NAMPRACK_ROOT}/src/host/hostiids.cpp
-        ${NAMPRACK_ROOT}/standalone/audiobackend.h
-        ${NAMPRACK_ROOT}/standalone/eventloop.h
-        ${NAMPRACK_ROOT}/standalone/eventloop.cpp
-        ${NAMPRACK_ROOT}/standalone/editorframe.h
-        ${NAMPRACK_ROOT}/standalone/editorframe.cpp
-        # The rack strip's window and the two kinds of window a hosted plug-in's editor can need:
-        # its own, or the generic parameter panel when it has no editor this host can show.
-        ${NAMPRACK_ROOT}/standalone/plugframe.h
-        ${NAMPRACK_ROOT}/standalone/plugframe.cpp
-        ${NAMPRACK_ROOT}/standalone/rackwindow.h
-        ${NAMPRACK_ROOT}/standalone/rackwindow.cpp
-        ${NAMPRACK_ROOT}/standalone/pluginwindow.h
-        ${NAMPRACK_ROOT}/standalone/pluginwindow.cpp
-        ${NAMPRACK_ROOT}/standalone/panelwindow.h
-        ${NAMPRACK_ROOT}/standalone/panelwindow.cpp
-        ${NAMPRACK_ROOT}/standalone/midiroute.h
-        ${NAMPRACK_ROOT}/standalone/midiroute.cpp
+set(NAMPRACK_STANDALONE_SOURCES
+    ${NAMPRACK_ROOT}/standalone/main.cpp
+    # The host-side interface IIDs, exactly once per final binary — see hostiids.cpp.
+    ${NAMPRACK_ROOT}/src/host/hostiids.cpp
+    ${NAMPRACK_ROOT}/standalone/audiobackend.h
+    ${NAMPRACK_ROOT}/standalone/nativeaudio.h
+    # The run loop and the windows, each a seam over a platform pair. Only one half of each pair is
+    # compiled; both halves are built by this machine's own two configures, which is what keeps the
+    # platform nobody is looking at today from rotting.
+    ${NAMPRACK_ROOT}/standalone/eventloop.h
+    ${NAMPRACK_ROOT}/standalone/windowevent.h
+    ${NAMPRACK_ROOT}/standalone/nativewindow.h
+    ${NAMPRACK_ROOT}/standalone/editorframe.h
+    ${NAMPRACK_ROOT}/standalone/editorframe.cpp
+    # The rack strip's window and the two kinds of window a hosted plug-in's editor can need:
+    # its own, or the generic parameter panel when it has no editor this host can show.
+    ${NAMPRACK_ROOT}/standalone/plugframe.h
+    ${NAMPRACK_ROOT}/standalone/plugframe.cpp
+    ${NAMPRACK_ROOT}/standalone/rackwindow.h
+    ${NAMPRACK_ROOT}/standalone/rackwindow.cpp
+    ${NAMPRACK_ROOT}/standalone/pluginwindow.h
+    ${NAMPRACK_ROOT}/standalone/pluginwindow.cpp
+    ${NAMPRACK_ROOT}/standalone/panelwindow.h
+    ${NAMPRACK_ROOT}/standalone/panelwindow.cpp
+    ${NAMPRACK_ROOT}/standalone/midiroute.h
+    ${NAMPRACK_ROOT}/standalone/midiroute.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/common/memorystream.cpp
+    ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/plugprovider.cpp
+    ${NAMPRACK_MODULE_LOADER_SRC}
+    ${VST3_SDK_DIR}/public.sdk/samples/vst-hosting/editorhost/source/usediids.cpp
+)
+if(WIN32)
+    list(APPEND NAMPRACK_STANDALONE_SOURCES
+        ${NAMPRACK_ROOT}/standalone/win32eventloop.h
+        ${NAMPRACK_ROOT}/standalone/win32eventloop.cpp
+        ${NAMPRACK_ROOT}/standalone/win32window.h
+        ${NAMPRACK_ROOT}/standalone/win32window.cpp
+        # Which of the two Windows backends drives the device, decided at run time.
+        ${NAMPRACK_ROOT}/standalone/winaudio.h
+        ${NAMPRACK_ROOT}/standalone/winaudio.cpp)
+else()
+    list(APPEND NAMPRACK_STANDALONE_SOURCES
+        ${NAMPRACK_ROOT}/standalone/x11eventloop.h
+        ${NAMPRACK_ROOT}/standalone/x11eventloop.cpp
+        ${NAMPRACK_ROOT}/standalone/x11window.h
+        ${NAMPRACK_ROOT}/standalone/x11window.cpp
         ${NAMPRACK_ROOT}/standalone/jackclient.h
-        ${NAMPRACK_ROOT}/standalone/jackclient.cpp
-        ${VST3_SDK_DIR}/public.sdk/source/common/memorystream.cpp
-        ${VST3_SDK_DIR}/public.sdk/source/vst/hosting/plugprovider.cpp
-        ${NAMPRACK_MODULE_LOADER_SRC}
-        ${VST3_SDK_DIR}/public.sdk/samples/vst-hosting/editorhost/source/usediids.cpp
-    )
-    target_include_directories(namp-rack
-        PRIVATE ${NAMPRACK_ROOT}/src ${NAMPRACK_ROOT}/standalone)
-    target_link_libraries(namp-rack
-        PRIVATE
-            NampRackPlugin
-            NampRackResources
-            NampRackRack
-            NampRackHost
-            sdk_hosting
-            PkgConfig::NAMPRACK_JACK
-            ${NAMPRACK_PLATFORM_GUI_LIBS}
-    )
-    target_compile_features(namp-rack PRIVATE cxx_std_17)
-    target_compile_options(namp-rack PRIVATE -Wall)
+        ${NAMPRACK_ROOT}/standalone/jackclient.cpp)
+endif()
 
+# usediids.cpp stays in the list above and nowhere else: it defines the SDK's interface IIDs and must
+# appear exactly once in a final binary. The plug-in-side classes come in through NampRackPlugin,
+# which does not carry them.
+add_executable(namp-rack ${NAMPRACK_STANDALONE_SOURCES})
+target_include_directories(namp-rack
+    PRIVATE ${NAMPRACK_ROOT}/src ${NAMPRACK_ROOT}/standalone)
+target_link_libraries(namp-rack
+    PRIVATE
+        NampRackPlugin
+        NampRackResources
+        NampRackRack
+        NampRackHost
+        sdk_hosting
+        ${NAMPRACK_PLATFORM_GUI_LIBS}
+)
+if(WIN32)
+    # NampRackWinAudio carries both backends, WinMM MIDI and the PCM conversion, and brings its own
+    # winmm/ole32/avrt/ksuser/uuid with it.
+    target_link_libraries(namp-rack PRIVATE NampRackWinAudio)
+else()
+    target_link_libraries(namp-rack PRIVATE PkgConfig::NAMPRACK_JACK)
+endif()
+target_compile_features(namp-rack PRIVATE cxx_std_17)
+target_compile_options(namp-rack PRIVATE -Wall)
+
+if(NOT WIN32)
     # Same reasoning as the bundle's --exclude-libs, one layer up. This binary contains the NAM DSP
     # core and the SDK's plug-in-side classes, and it will dlopen OTHER people's plug-ins —
     # including other NAM-based ones. Anything it exported would interpose on theirs, and two
@@ -1190,6 +1227,12 @@ if(NOT WIN32)
     # --whole-archive still applies where it is asked for: it decides which OBJECTS are pulled in,
     # and the DSP core's self-registering architectures are registered from .init_array, which
     # needs no exported symbol.
+    #
+    # WINDOWS NEEDS NO COUNTERPART, and the difference is real rather than an omission. ELF resolves
+    # symbols through one process-wide namespace, which is what makes interposition possible at all;
+    # PE binds each module to a named DLL at load time, so a plug-in cannot accidentally resolve a
+    # Steinberg symbol against this executable. An .exe also publishes no import library for one to
+    # bind to even deliberately.
     target_link_options(namp-rack PRIVATE -Wl,--exclude-libs,ALL)
 endif()
 

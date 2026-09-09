@@ -67,6 +67,24 @@ JackClient::~JackClient()
 }
 
 //------------------------------------------------------------------------
+// A first connection just to learn the server's rate and block size. JackNoStartServer because this
+// is a question, not a request: a standalone that started a JACK server as a side effect of being
+// launched would be making a decision about the machine that is not its to make.
+bool JackClient::probeDefaults(double &sampleRate, int &blockSize)
+{
+    jack_status_t status = static_cast<jack_status_t>(0);
+    jack_client_t *probe = jack_client_open("NAMp-Rack-probe", JackNoStartServer, &status);
+    if (!probe) {
+        fprintf(stderr, "namp-rack: no JACK server; continuing with the editor only\n");
+        return false;
+    }
+    sampleRate = static_cast<double>(jack_get_sample_rate(probe));
+    blockSize = static_cast<int>(jack_get_buffer_size(probe));
+    jack_client_close(probe);
+    return true;
+}
+
+//------------------------------------------------------------------------
 bool JackClient::open(const char *clientName, Vst::IAudioProcessor *processor,
                       Vst::IComponent *component, const MidiRoute *route)
 {

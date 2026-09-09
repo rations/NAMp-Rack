@@ -51,6 +51,25 @@ void copyString128(const Vst::TChar *src, char *dst, size_t dstLen)
     std::snprintf(dst, dstLen, "%s", utf8.c_str());
 }
 
+//------------------------------------------------------------------------
+// The window type a hosted editor is embedded into on THIS platform, and the answer differs.
+//
+// Both of the calls that need it — isPlatformTypeSupported, to decide whether this plug-in has an
+// editor this host can show at all, and attached, to give it the window — used to name the X11
+// constant outright. That is correct on Linux and silently wrong on Windows: every hosted plug-in
+// would report no embeddable editor, and the rack would quietly fall back to the generic parameter
+// panel for all of them. Nothing would look broken; the editors would just never appear.
+//
+// It is chosen here rather than taken from the standalone's own window seam because this file is
+// the host layer: it is built into the offline tools and the plug-in bundle as well, neither of
+// which owns a window. The SDK's own platform macro is the whole dependency.
+inline const FIDString kHostPlatformType =
+#if SMTG_OS_WINDOWS
+    kPlatformTypeHWND;
+#else
+    kPlatformTypeX11EmbedWindowID;
+#endif
+
 } // namespace
 
 //------------------------------------------------------------------------
@@ -1077,7 +1096,7 @@ bool Vst3Backend::editorOpen(const EditorOpenRequest &request, EditorSurface &ou
             return false;
     }
 
-    if (mView->isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) != kResultTrue) {
+    if (mView->isPlatformTypeSupported(kHostPlatformType) != kResultTrue) {
         mView = nullptr;
         return false; // caller falls back to the generic panel
     }
@@ -1089,8 +1108,8 @@ bool Vst3Backend::editorOpen(const EditorOpenRequest &request, EditorSurface &ou
     if (request.plugFrame)
         mView->setFrame(static_cast<IPlugFrame *>(request.plugFrame));
 
-    if (mView->attached(reinterpret_cast<void *>(request.parentWindow),
-                        kPlatformTypeX11EmbedWindowID) != kResultTrue) {
+    if (mView->attached(reinterpret_cast<void *>(request.parentWindow), kHostPlatformType) !=
+        kResultTrue) {
         mView->setFrame(nullptr);
         mView = nullptr;
         return false;

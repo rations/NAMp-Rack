@@ -1,16 +1,21 @@
-// RackWindow — the rack strip's own X window, below the amp's editor in the main window.
+// RackWindow — the rack strip's own window, below the amp's editor in the main window.
 //
 // A SIBLING CHILD WINDOW, not a region of the top-level. The amp's editor creates its own child
-// window inside the top-level and handles its own input on its own X connection; the top-level
-// therefore selects only structure events and would never see a click meant for the rack. Giving
-// the rack a child window of its own means the two input paths never have to be told apart, and the
-// editor's window can stay exactly what it was.
+// window inside the top-level and handles its own input on its own connection to the display; the
+// top-level therefore asks for structure events only and would never see a click meant for the
+// rack. Giving the rack a child window of its own means the two input paths never have to be told
+// apart, and the editor's window can stay exactly what it was.
 //
 // PAINTING FOLLOWS THE SAME DISCIPLINE AS THE EDITOR ABOVE IT, and it is the editor's for a reason
-// that applies here too: an X event never paints. It sets a dirty flag, and the next timer tick
-// composes the whole strip into an offscreen image surface and blits it once with
-// CAIRO_OPERATOR_SOURCE. A host that re-enters its run loop can therefore never recurse into
-// drawing, and no partially drawn frame is ever on screen.
+// that applies here too: an event never paints. It sets a dirty flag, and the next timer tick
+// composes the whole strip offscreen and presents it in one operation. A host that re-enters its
+// run loop can therefore never recurse into drawing, and no partially drawn frame is ever on
+// screen.
+//
+// NOTHING HERE KNOWS WHICH WINDOWING SYSTEM IT IS ON. The window, its surfaces, the keyboard focus
+// and the translation of whatever the system reported into a WindowEvent all live behind
+// nativewindow.h. What is left in this file is the part that is the same everywhere, and it is
+// nearly all of it.
 //
 // ONE LOGICAL CANVAS. The strip is drawn in the same logical units as the editor and scaled by the
 // same factor — one cairo_scale at compose time — so the two always agree at every window size.
@@ -26,13 +31,12 @@
 #pragma once
 
 #include "eventloop.h"
+#include "nativewindow.h"
 
 #include "gfx/fontstack.h"
 #include "host/chainbuilder.h"
 #include "rack/rackmodel.h"
 #include "rack/rackview.h"
-
-#include <X11/Xlib.h>
 
 #include <functional>
 #include <string>
@@ -149,7 +153,7 @@ public:
         return mPresetName;
     }
 
-    bool create(::Window parent, int x, int y, int w, int h);
+    bool create(NativeHandle parent, int x, int y, int w, int h);
     void destroy();
 
     // Move and resize with the top-level. `scale` is the window's logical-to-pixel factor, the same
@@ -200,24 +204,22 @@ public:
     }
 
 private:
-    void onXEvent(const XEvent &event);
+    void onEvent(const WindowEvent &event);
     void redraw();
-    bool resizeSurfaces(int w, int h);
 
-    // Hold the keyboard while, and only while, the rack has a text field open.
+    // Take or release the keyboard to match whether a text field is open. Called after anything
+    // that could have opened or closed one, so there is no path that leaves the focus held by a
+    // shut field.
     //
-    // The same contract the editor works under and for the same reason. Selecting KeyPressMask on
-    // this window costs nothing on its own — X delivers a key here only while this window holds the
-    // input focus — so everything rests on the focus being taken around an open field and handed
-    // straight back. Outside that, the rack claims no keys at all and whatever else is listening is
-    // untouched. Never a grab: a focus request the window manager declines simply leaves the field
-    // untyped, which is a field that does not work rather than a desktop that does not.
-    void setKeyboardFocus(bool wanted);
-    // Take or release the focus to match whether a field is open. Called after anything that could
-    // have opened or closed one, so there is no path that leaves the focus held by a shut field.
+    // The mechanism is the window's; the POLICY is here, and it is the same contract the editor
+    // works under. Asking the window for keys costs nothing on its own — a key is delivered only
+    // while the window holds the input focus — so everything rests on the focus being taken around
+    // an open field and handed straight back. Outside that the rack claims no keys at all and
+    // whatever else is listening is untouched. Never a grab: a focus request the window manager
+    // declines simply leaves the field untyped, which is a field that does not work rather than a
+    // desktop that does not.
     void syncKeyboardFocus();
 
-    EventLoop &mLoop;
     NAMp::host::ChainBuilder &mBuilder;
     FontStack mFonts;
     NAMp::rack::RackModel mModel;
@@ -234,17 +236,10 @@ private:
     EditSearchPath mRemoveSearchPath;
     std::string mPresetName;
 
-    ::Window mWindow = 0;
-    cairo_surface_t *mTarget = nullptr; // the X window
-    cairo_surface_t *mBuffer = nullptr; // composed here, then blitted in one operation
+    NativeWindow mWindow;
     int mWidth = 0, mHeight = 0;
     double mScale = 1.0;
 
-    // Focus bookkeeping. mPrevFocus is whoever held it when the field opened, so it can be given
-    // back rather than dropped on the root window.
-    bool mKeyFocus = false;
-    ::Window mPrevFocus = 0;
-    int mPrevRevert = RevertToParent;
     bool mDirty = true;
     bool mScanPending = false;
 };

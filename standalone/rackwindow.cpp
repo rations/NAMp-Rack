@@ -6,31 +6,14 @@
 
 #include "rack/rackgeometry.h"
 
-#include <cairo/cairo-xlib.h>
-
-// XK_* for the key mapping, and XLookupString's declaration.
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
-
 #include <cstdio>
 
 namespace Rations
 {
 
-namespace
-{
-
-// X button numbers. 4 and 5 are the wheel, which X reports as button presses.
-constexpr int kButtonLeft = 1;
-constexpr int kButtonRight = 3;
-constexpr int kButtonWheelUp = 4;
-constexpr int kButtonWheelDown = 5;
-
-} // namespace
-
 //------------------------------------------------------------------------
 RackWindow::RackWindow(EventLoop &loop, NAMp::host::ChainBuilder &builder)
-    : mLoop(loop), mBuilder(builder)
+    : mBuilder(builder), mWindow(loop)
 {
     mModel.setBuilder(&builder);
     mView.setModel(&mModel);
@@ -55,48 +38,30 @@ void RackWindow::loadFonts(const std::string &resourceDir)
 }
 
 //------------------------------------------------------------------------
-bool RackWindow::create(::Window parent, int x, int y, int w, int h)
+bool RackWindow::create(NativeHandle parent, int x, int y, int w, int h)
 {
-    ::Display *display = mLoop.display();
-    if (!display || !parent || w <= 0 || h <= 0)
+    if (!parent || w <= 0 || h <= 0)
         return false;
-    if (mWindow)
+    if (mWindow.isOpen())
         return true;
 
-    const int screen = DefaultScreen(display);
-    mWindow = XCreateSimpleWindow(display, parent, x, y, static_cast<unsigned>(w),
-                                  static_cast<unsigned>(h), 0, BlackPixel(display, screen),
-                                  BlackPixel(display, screen));
-    if (!mWindow)
+    // Input::Full: unlike the top-level, this window wants input — the rack is the one part of the
+    // interface the standalone draws and handles itself. Keys among them, for the preset name field
+    // and nothing else; see syncKeyboardFocus for why asking for them claims nothing.
+    if (!mWindow.createChild(parent, x, y, w, h, NativeWindow::Input::Full))
         return false;
 
-    // Unlike the top-level, this window wants input: the rack is the one part of the interface the
-    // standalone draws and handles itself.
-    //
-    // KeyPressMask and FocusChangeMask are here for the preset name field and nothing else. The
-    // mask alone claims no keys: X routes a key to this window only while it holds the input focus,
-    // and the focus is taken only around an open field (setKeyboardFocus).
-    XSelectInput(display, mWindow,
-                 ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                     LeaveWindowMask | StructureNotifyMask | KeyPressMask | FocusChangeMask);
-    mLoop.addWindow(mWindow, [this](const XEvent &event) { onXEvent(event); });
+    mWindow.setEventCallback([this](const WindowEvent &event) { onEvent(event); });
 
-    Visual *visual = DefaultVisual(display, screen);
-    mTarget = cairo_xlib_surface_create(display, mWindow, visual, w, h);
-    if (cairo_surface_status(mTarget) != CAIRO_STATUS_SUCCESS) {
+    mWidth = w;
+    mHeight = h;
+    if (!mWindow.createSurfaces(w, h)) {
         fprintf(stderr, "namp-standalone: cannot create the rack's drawing surface\n");
         destroy();
         return false;
     }
-    mWidth = w;
-    mHeight = h;
-    if (!resizeSurfaces(w, h)) {
-        destroy();
-        return false;
-    }
 
-    XMapWindow(display, mWindow);
-    XFlush(display);
+    mWindow.show();
     mDirty = true;
     return true;
 }
@@ -104,64 +69,24 @@ bool RackWindow::create(::Window parent, int x, int y, int w, int h)
 //------------------------------------------------------------------------
 void RackWindow::destroy()
 {
-    // Never leave the focus pointed at a window that is about to stop existing.
-    setKeyboardFocus(false);
-
-    if (mBuffer) {
-        cairo_surface_destroy(mBuffer);
-        mBuffer = nullptr;
-    }
-    if (mTarget) {
-        cairo_surface_destroy(mTarget);
-        mTarget = nullptr;
-    }
-    if (mWindow) {
-        mLoop.removeWindow(mWindow);
-        if (::Display *display = mLoop.display()) {
-            XDestroyWindow(display, mWindow);
-            XFlush(display);
-        }
-        mWindow = 0;
-    }
-}
-
-//------------------------------------------------------------------------
-// The xlib surface wraps a window we resized, so it is told its new size in place; the offscreen
-// buffer has a fixed allocation and has to be rebuilt. Same split as the plug-in's own view.
-bool RackWindow::resizeSurfaces(int w, int h)
-{
-    if (w <= 0 || h <= 0)
-        return false;
-
-    if (mTarget)
-        cairo_xlib_surface_set_size(mTarget, w, h);
-
-    if (mBuffer)
-        cairo_surface_destroy(mBuffer);
-    mBuffer = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
-    if (cairo_surface_status(mBuffer) != CAIRO_STATUS_SUCCESS) {
-        fprintf(stderr, "namp-standalone: cannot create the rack's %dx%d buffer\n", w, h);
-        cairo_surface_destroy(mBuffer);
-        mBuffer = nullptr;
-        return false;
-    }
-    return true;
+    // The window releases the keyboard focus and stops dispatching before it goes; both are inside
+    // destroy() and in that order.
+    mWindow.destroy();
 }
 
 //------------------------------------------------------------------------
 void RackWindow::setGeometry(int x, int y, int w, int h, double scale)
 {
-    ::Display *display = mLoop.display();
-    if (!display || !mWindow || w <= 0 || h <= 0)
+    if (!mWindow.isOpen() || w <= 0 || h <= 0)
         return;
 
     mScale = scale > 0.0 ? scale : 1.0;
-    XMoveResizeWindow(display, mWindow, x, y, static_cast<unsigned>(w), static_cast<unsigned>(h));
+    mWindow.moveResize(x, y, w, h);
 
     if (w != mWidth || h != mHeight) {
         mWidth = w;
         mHeight = h;
-        resizeSurfaces(w, h);
+        mWindow.resizeSurfaces(w, h);
     }
     mDirty = true;
 }
@@ -197,12 +122,13 @@ void RackWindow::onTimer()
 //------------------------------------------------------------------------
 void RackWindow::redraw()
 {
-    if (!mBuffer || !mTarget)
+    cairo_surface_t *surface = mWindow.drawingSurface();
+    if (!surface)
         return;
     mDirty = false;
 
     // Compose offscreen...
-    cairo_t *cr = cairo_create(mBuffer);
+    cairo_t *cr = cairo_create(surface);
     if (cairo_status(cr) == CAIRO_STATUS_SUCCESS) {
         // The single scale the whole design rests on. Everything below is in logical units.
         cairo_scale(cr, mScale, mScale);
@@ -211,18 +137,8 @@ void RackWindow::redraw()
     }
     cairo_destroy(cr);
 
-    // ...then blit in one operation, so no partially drawn frame is ever visible.
-    cairo_t *out = cairo_create(mTarget);
-    if (cairo_status(out) == CAIRO_STATUS_SUCCESS) {
-        cairo_set_operator(out, CAIRO_OPERATOR_SOURCE);
-        cairo_set_source_surface(out, mBuffer, 0.0, 0.0);
-        cairo_paint(out);
-    }
-    cairo_destroy(out);
-
-    cairo_surface_flush(mTarget);
-    if (::Display *display = mLoop.display())
-        XFlush(display);
+    // ...then present in one operation, so no partially drawn frame is ever visible.
+    mWindow.present();
 }
 
 //------------------------------------------------------------------------
@@ -231,11 +147,11 @@ void RackWindow::redraw()
 // A scan is synchronous: it walks every bundle and spawns a helper process for each one that
 // changed, and the run loop does not tick again until it returns. Painting on the next tick would
 // therefore mean painting when it is over, which is exactly when nobody needs to be told it is
-// running — so this composes and blits immediately, the same way onTimer does.
+// running — so this composes and presents immediately, the same way onTimer does.
 //
 // That is allowed because of where it is called from: requestScan() defers the whole scan to the
-// timer tick, so this never runs inside an X event handler and nothing here can recurse into
-// drawing at all. No X event is dispatched while it runs.
+// timer tick, so this never runs inside a window's event callback and nothing here can recurse into
+// drawing at all. No window event is dispatched while it runs.
 void RackWindow::showScanProgress(int index, int total, const std::string &current)
 {
     NAMp::rack::ScanState &scan = mModel.scan();
@@ -254,140 +170,47 @@ void RackWindow::endScanProgress()
 }
 
 //------------------------------------------------------------------------
-// Ported from the editor's X11 view, which had to answer the same question first. The mapping of
-// X modifier masks onto KeyModifier is the part worth reading twice: KeyModifier documents
-// kCommandKey as "Windows: ctrl key" and kControlKey as "Windows: win key", so ControlMask is
-// kCommandKey here and Mod4 (Super) is kControlKey. The other way round makes Ctrl-C read as a
-// plain C.
-namespace
-{
-
-Steinberg::int16 virtualKeyFromKeySym(KeySym sym)
-{
-    switch (sym) {
-        case XK_BackSpace:
-            return Steinberg::KEY_BACK;
-        case XK_Tab:
-            return Steinberg::KEY_TAB;
-        case XK_Return:
-            return Steinberg::KEY_RETURN;
-        case XK_KP_Enter:
-            return Steinberg::KEY_ENTER;
-        case XK_Escape:
-            return Steinberg::KEY_ESCAPE;
-        case XK_Delete:
-        case XK_KP_Delete:
-            return Steinberg::KEY_DELETE;
-        case XK_Left:
-        case XK_KP_Left:
-            return Steinberg::KEY_LEFT;
-        case XK_Right:
-        case XK_KP_Right:
-            return Steinberg::KEY_RIGHT;
-        case XK_Home:
-        case XK_KP_Home:
-            return Steinberg::KEY_HOME;
-        case XK_End:
-        case XK_KP_End:
-            return Steinberg::KEY_END;
-        default:
-            return 0;
-    }
-}
-
-} // namespace
-
-//------------------------------------------------------------------------
-void RackWindow::setKeyboardFocus(bool wanted)
-{
-    Display *display = mLoop.display();
-    if (!display || !mWindow || wanted == mKeyFocus)
-        return;
-
-    if (wanted) {
-        // XSetInputFocus on a window that is not viewable is a BadMatch.
-        XWindowAttributes attrs;
-        if (XGetWindowAttributes(display, mWindow, &attrs) == 0 || attrs.map_state != IsViewable)
-            return;
-        ::Window focus = 0;
-        int revert = RevertToParent;
-        XGetInputFocus(display, &focus, &revert);
-        mPrevFocus = focus;
-        mPrevRevert = revert;
-        XSetInputFocus(display, mWindow, RevertToParent, CurrentTime);
-        XFlush(display);
-        mKeyFocus = true;
-        return;
-    }
-
-    mKeyFocus = false;
-    const ::Window prev = mPrevFocus;
-    mPrevFocus = 0;
-    // PointerRoot and None are legal focus values in their own right and are handed back as they
-    // are; a real window may have been destroyed while we held the focus, so it is probed first
-    // rather than trusted. A failed probe leaves the focus here — wrong, but far better than
-    // pointing it at a dead id.
-    if (prev == PointerRoot || prev == None) {
-        XSetInputFocus(display, prev, mPrevRevert, CurrentTime);
-    } else if (prev != mWindow) {
-        XWindowAttributes attrs;
-        if (XGetWindowAttributes(display, prev, &attrs) != 0)
-            XSetInputFocus(display, prev, mPrevRevert, CurrentTime);
-    }
-    XFlush(display);
-}
-
-//------------------------------------------------------------------------
 void RackWindow::syncKeyboardFocus()
 {
-    setKeyboardFocus(mView.wantsKeyboard());
+    mWindow.setKeyboardFocus(mView.wantsKeyboard());
 }
 
 //------------------------------------------------------------------------
-void RackWindow::onXEvent(const XEvent &event)
+void RackWindow::onEvent(const WindowEvent &event)
 {
     // Nothing here paints. Every branch either updates state or asks for a repaint on the next
     // tick — see the discipline note in the header.
+    //
+    // COORDINATES ARE DIVIDED BY THE SCALE HERE AND NOWHERE ELSE. A window reports physical pixels;
+    // the strip is laid out in the same logical units as the editor above it and drawn at the same
+    // factor, so this is the one boundary where a pixel becomes a logical unit. That is why nothing
+    // in the rack code below knows what a pixel is.
     const double scale = mScale > 0.0 ? mScale : 1.0;
+    const float x = static_cast<float>(event.x / scale);
+    const float y = static_cast<float>(event.y / scale);
 
-    switch (event.type) {
-        case Expose:
+    switch (event.kind) {
+        case WindowEvent::Kind::Redraw:
             mDirty = true;
             return;
 
-        case ConfigureNotify:
-            if (event.xconfigure.width != mWidth || event.xconfigure.height != mHeight) {
-                mWidth = event.xconfigure.width;
-                mHeight = event.xconfigure.height;
-                resizeSurfaces(mWidth, mHeight);
+        case WindowEvent::Kind::Resize:
+            if (event.width != mWidth || event.height != mHeight) {
+                mWidth = event.width;
+                mHeight = event.height;
+                mWindow.resizeSurfaces(mWidth, mHeight);
             }
             mDirty = true;
             return;
 
-        case KeyPress: {
-            // XLookupString applies the shift and lock state and yields the Latin-1 byte, which is
-            // why the character comes from it rather than from the keysym by hand. One byte is
-            // asked for because the field is ASCII only; a longer answer is a multi-byte character
-            // the field cannot store.
-            XKeyEvent ke = event.xkey;
-            char text[8] = {0};
-            KeySym sym = NoSymbol;
-            const int n = XLookupString(&ke, text, sizeof(text) - 1, &sym, nullptr);
-            const unsigned char byte = (n >= 1) ? static_cast<unsigned char>(text[0]) : 0;
-            const Steinberg::char16 ch =
-                (byte >= 0x20 && byte < 0x7F) ? static_cast<Steinberg::char16>(byte) : 0;
+        case WindowEvent::Kind::Close:
+            // A child window is never asked to close on its own; the top-level is what carries the
+            // close request, and the standalone handles it there.
+            return;
 
-            Steinberg::int16 mods = 0;
-            if (ke.state & ShiftMask)
-                mods |= Steinberg::kShiftKey;
-            if (ke.state & ControlMask)
-                mods |= Steinberg::kCommandKey;
-            if (ke.state & Mod1Mask)
-                mods |= Steinberg::kAlternateKey;
-            if (ke.state & Mod4Mask)
-                mods |= Steinberg::kControlKey;
-
-            const NAMp::rack::RackAction action = mView.key(ch, virtualKeyFromKeySym(sym), mods);
+        case WindowEvent::Kind::Key: {
+            const NAMp::rack::RackAction action =
+                mView.key(event.character, event.virtualKey, event.modifiers);
             if (applyAction(action) || action.kind != NAMp::rack::RackAction::Kind::NoAction)
                 mDirty = true;
             // After, not before: the key that closed the field is what releases the keyboard.
@@ -395,23 +218,18 @@ void RackWindow::onXEvent(const XEvent &event)
             return;
         }
 
-        case FocusOut:
-            // The focus can be taken away by the window manager at any moment. Let the flag follow
-            // reality, or a later release would hand focus somewhere it no longer is and steal it
-            // from whoever holds it now.
-            mKeyFocus = false;
-            mPrevFocus = 0;
+        case WindowEvent::Kind::FocusLost:
+            // The window has already dropped its own claim; there is nothing for the rack to do but
+            // leave the field as it is. Whatever is typed next goes wherever the focus went.
             return;
 
-        case LeaveNotify:
+        case WindowEvent::Kind::MouseLeave:
             // Clear the hover, or a control keeps its highlight after the pointer has gone.
             mModel.setHover(NAMp::rack::HitTarget());
             mDirty = true;
             return;
 
-        case MotionNotify: {
-            const float x = static_cast<float>(event.xmotion.x / scale);
-            const float y = static_cast<float>(event.xmotion.y / scale);
+        case WindowEvent::Kind::MouseMove: {
             // Motion ACTS, it does not only repaint. A drag on the wet/dry slider reports its new
             // value from here and nowhere else, so a handler that merely set the dirty flag drew
             // the drag and threw the value away.
@@ -421,22 +239,17 @@ void RackWindow::onXEvent(const XEvent &event)
             return;
         }
 
-        case ButtonPress: {
-            const float x = static_cast<float>(event.xbutton.x / scale);
-            const float y = static_cast<float>(event.xbutton.y / scale);
-            const int button = static_cast<int>(event.xbutton.button);
+        case WindowEvent::Kind::Wheel: {
+            const NAMp::rack::RackAction action = mView.wheel(x, y, event.delta);
+            if (applyAction(action) || action.kind != NAMp::rack::RackAction::Kind::NoAction)
+                mDirty = true;
+            return;
+        }
 
-            if (button == kButtonWheelUp || button == kButtonWheelDown) {
-                const int delta = button == kButtonWheelUp ? 1 : -1;
-                const NAMp::rack::RackAction action = mView.wheel(x, y, delta);
-                if (applyAction(action) || action.kind != NAMp::rack::RackAction::Kind::NoAction)
-                    mDirty = true;
+        case WindowEvent::Kind::MouseDown: {
+            if (event.button != kButtonLeft && event.button != kButtonRight)
                 return;
-            }
-            if (button != kButtonLeft && button != kButtonRight)
-                return;
-
-            const NAMp::rack::RackAction action = mView.mouseDown(x, y, button);
+            const NAMp::rack::RackAction action = mView.mouseDown(x, y, event.button);
             if (applyAction(action) || action.kind != NAMp::rack::RackAction::Kind::NoAction)
                 mDirty = true;
             // A click is what opens the name field and what dismisses it, so this is the other end
@@ -446,20 +259,14 @@ void RackWindow::onXEvent(const XEvent &event)
             return;
         }
 
-        case ButtonRelease: {
-            const int button = static_cast<int>(event.xbutton.button);
-            if (button != kButtonLeft && button != kButtonRight)
+        case WindowEvent::Kind::MouseUp: {
+            if (event.button != kButtonLeft && event.button != kButtonRight)
                 return;
-            const float x = static_cast<float>(event.xbutton.x / scale);
-            const float y = static_cast<float>(event.xbutton.y / scale);
-            const NAMp::rack::RackAction action = mView.mouseUp(x, y, button);
+            const NAMp::rack::RackAction action = mView.mouseUp(x, y, event.button);
             if (applyAction(action) || action.kind != NAMp::rack::RackAction::Kind::NoAction)
                 mDirty = true;
             return;
         }
-
-        default:
-            return;
     }
 }
 

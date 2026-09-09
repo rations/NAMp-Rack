@@ -48,8 +48,10 @@ namespace NAMp::host
 {
 
 //------------------------------------------------------------------------
-// Asking a backend to open its editor. `parentWindow` is an X11 Window id and `plugFrame` a
-// Steinberg::IPlugFrame*, both passed opaquely so this header needs neither Xlib nor the SDK.
+// Asking a backend to open its editor. `parentWindow` is the platform's own window id — an X11
+// Window on Linux, an HWND on Windows — and `plugFrame` a Steinberg::IPlugFrame*, both passed
+// opaquely so this header needs neither a windowing system nor the SDK. uintptr_t rather than void*
+// because an X id is an integer and not a pointer, and it is the wider of the two spellings.
 struct EditorOpenRequest {
     uintptr_t parentWindow = 0;
     void *plugFrame = nullptr;
@@ -57,8 +59,9 @@ struct EditorOpenRequest {
 };
 
 //------------------------------------------------------------------------
-// What came back. `childWindow` is the X11 Window the plug-in created inside our parent (LV2);
-// `plugView` is the Steinberg::IPlugView* (VST3). Exactly one is meaningful, per `kind`.
+// What came back. `childWindow` is the window the plug-in created inside our parent, which only an
+// LV2 X11 UI does — the format is Linux-only, so this is always an X11 Window when it is set at
+// all; `plugView` is the Steinberg::IPlugView* (VST3). Exactly one is meaningful, per `kind`.
 struct EditorSurface {
     EditorKind kind = EditorKind::NoEditor;
     uintptr_t childWindow = 0;

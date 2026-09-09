@@ -2,8 +2,6 @@
 
 #include "editorframe.h"
 
-#include <X11/Xutil.h>
-
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -42,8 +40,12 @@ tresult PLUGIN_API EditorFrame::queryInterface(const TUID iid, void **obj)
     if (!obj)
         return kInvalidArgument;
 
+#if !SMTG_OS_WINDOWS
+    // Offered on this platform only; see the same guard in plugframe.cpp for why, and eventloop.h
+    // for what Windows has instead.
     if (FUnknownPrivate::iidEqual(iid, Linux::IRunLoop::iid))
         return mLoop.queryInterface(iid, obj);
+#endif
 
     if (FUnknownPrivate::iidEqual(iid, IPlugFrame::iid) ||
         FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
@@ -120,9 +122,9 @@ bool EditorFrame::constrainToFixedPoint(ViewRect &rect) const
 }
 
 //------------------------------------------------------------------------
-void EditorFrame::setEmbedding(::Window window, IPlugView *view)
+void EditorFrame::setEmbedding(NativeWindow &window, IPlugView *view)
 {
-    mWindow = window;
+    mWindow = &window;
     mView = view;
 
     ViewRect current = {};
@@ -142,22 +144,19 @@ void EditorFrame::setEmbedding(::Window window, IPlugView *view)
 //------------------------------------------------------------------------
 void EditorFrame::applySize(int w, int h)
 {
-    ::Display *display = mLoop.display();
-    if (!display || !mWindow || w <= 0 || h <= 0)
+    if (!mWindow || w <= 0 || h <= 0)
         return;
-    // Recorded BEFORE the request, because the ConfigureNotify it provokes may be dispatched
-    // before we return here and must already be recognisable as ours.
+    // Recorded BEFORE the request, because the resize event it provokes may be dispatched before we
+    // return here and must already be recognisable as ours.
     mAppliedW = w;
     mAppliedH = h;
-    XResizeWindow(display, mWindow, static_cast<unsigned>(w), static_cast<unsigned>(h));
-    XFlush(display);
+    mWindow->resize(w, h);
 }
 
 //------------------------------------------------------------------------
 void EditorFrame::updateSizeHints()
 {
-    ::Display *display = mLoop.display();
-    if (!display || !mWindow || !mView)
+    if (!mWindow || !mView)
         return;
 
     // Ask the view rather than deciding here: this file knows nothing about pages, and does not
@@ -179,25 +178,24 @@ void EditorFrame::updateSizeHints()
     // The strip rides along with the editor, so the WINDOW's limits are the editor's limits plus
     // the strip at each of them. Leaving the editor-only numbers here would let the window manager
     // offer a height with the bottom of the strip clipped off.
-    XSizeHints hints = {};
-    hints.flags = PMinSize;
-    hints.min_width = minW;
-    hints.min_height = minH + stripHeightFor(minW);
+    int hintMinW = minW;
+    int hintMinH = minH + stripHeightFor(minW);
+    // Zero means "no limit" to the window, which is what an unusable answer from the view has to
+    // become: a maximum below the minimum would pin the window to nonsense.
+    int hintMaxW = 0;
+    int hintMaxH = 0;
     if (maxW >= minW && maxH >= minH) {
-        hints.flags |= PMaxSize;
-        hints.max_width = maxW;
-        hints.max_height = maxH + stripHeightFor(maxW);
+        hintMaxW = maxW;
+        hintMaxH = maxH + stripHeightFor(maxW);
     }
     // A view that cannot be resized is pinned at the size it has, which is what a host would do
     // with canResize() == kResultFalse.
     if (mView->canResize() != kResultTrue && mAppliedW > 0 && mAppliedH > 0) {
-        hints.flags |= PMinSize | PMaxSize;
-        hints.min_width = hints.max_width = mAppliedW;
-        hints.min_height = hints.max_height = mAppliedH;
+        hintMinW = hintMaxW = mAppliedW;
+        hintMinH = hintMaxH = mAppliedH;
     }
-    XSetWMNormalHints(display, mWindow, &hints);
-    trace("hints: %d..%d wide, %d..%d tall", hints.min_width, hints.max_width, hints.min_height,
-          hints.max_height);
+    mWindow->setSizeHints(hintMinW, hintMinH, hintMaxW, hintMaxH);
+    trace("hints: %d..%d wide, %d..%d tall", hintMinW, hintMaxW, hintMinH, hintMaxH);
 }
 
 //------------------------------------------------------------------------

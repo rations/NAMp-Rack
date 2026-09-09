@@ -18,7 +18,7 @@
 // and the run loop are all single-threaded here, which is the same contract a DAW provides.
 
 #include "audiobackend.h"
-#include "jackclient.h"
+#include "nativeaudio.h"
 #include "midiroute.h"
 #include "editorframe.h"
 #include "rackwindow.h"
@@ -49,9 +49,6 @@
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/vsttypes.h"
-
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
 
 #include <csignal>
 #include <cstdio>
@@ -153,33 +150,154 @@ private:
 };
 
 //------------------------------------------------------------------------
-// Re-runs setupProcessing when the audio system changes its buffer size under the running client.
-// The chunk loop inside the backend keeps audio correct without this - no block ever reaches the
-// processor larger than the size it was set up for - but the processor would otherwise stay
-// configured for the size it saw at startup, sizing its internal buffers and its reported latency
-// for a block the host is no longer sending.
+// The FUnknown half of a timer, written once for the seven of them in this file.
 //
-// This runs on the run loop, not in the audio system's own notification callback: setActive and
+// LIFETIME IS THE C++ OBJECT'S, not the reference count's. Every one of these lives on main's stack
+// for as long as it is registered and the loop holds a borrowed pointer, so a fixed count keeps a
+// caller that releases more times than it addRefs from taking the object down with it.
+//
+// THE INTERFACE LOOKUP IS LINUX-ONLY, and that is the SDK's own boundary rather than a shortcut.
+// Steinberg::Linux::ITimerHandler::iid is DEFINED only under #if SMTG_OS_LINUX — see the SDK's
+// common IID translation unit — because Linux is the one platform where a plug-in has no event loop
+// and the host must lend it one as a queryable interface. On Windows the system runs that loop,
+// this project's own pump calls onTimer() on the C++ object, and nothing ever asks these for an
+// interface: there is no IID to compare against and no symbol to reference. Answering kNoInterface
+// is therefore the whole truth on that platform, not a stub.
+//
+// The base is still Linux::ITimerHandler on both, and that is deliberate: the SDK declares the type
+// unconditionally — measured, there is no platform guard on the declaration in iplugview.h, only on
+// the IID's definition — so using it as the callback interface is what lets these seven classes be
+// written once instead of twice. See eventloop.h.
+class TimerHandler : public Linux::ITimerHandler
+{
+public:
+    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
+    {
+        if (!obj)
+            return kInvalidArgument;
+#if SMTG_OS_LINUX
+        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = static_cast<Linux::ITimerHandler *>(this);
+            return kResultOk;
+        }
+#else
+        (void)iid;
+#endif
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE
+    {
+        return 1000;
+    }
+};
+
+//------------------------------------------------------------------------
+// Keeps the processor configured for the device that is actually there. Two things can move it, and
+// both arrive as a flag the backend raises and this polls:
+//
+//   * THE BUFFER SIZE CHANGED under the running client. The chunk loop inside the backend keeps
+//   audio
+//     correct without this — no block ever reaches the processor larger than the size it was set up
+//     for — but the processor would otherwise stay configured for the size it saw at startup,
+//     sizing its internal buffers and its reported latency for a block the host is no longer
+//     sending.
+//
+//   * THE DEVICE ASKED TO BE REOPENED, or stopped existing. On Windows this is routine rather than
+//     exceptional: an ASIO driver raises it when its own control panel changes the buffer size,
+//     which is how a player changes their latency, and again when the sample rate moves; a WASAPI
+//     endpoint raises it when it is unplugged. Reopening rather than reconfiguring is the driver's
+//     contract — see reopen(). Nothing consumed this flag before, so on that platform a trip to the
+//     driver's control panel would have left the device silent with no indication why.
+//
+// THIS RUNS ON THE RUN LOOP, not in the audio system's own notification callback: setActive and
 // setupProcessing are VST3 main-thread calls and the plug-in's message thread may be part-way
 // through a load. AudioBackend::suspendProcessing() is what keeps the audio callback out of the
 // processor while it is reconfigured.
-class BufferSizeWatcher : public Linux::ITimerHandler
+class DeviceWatcher : public TimerHandler
 {
 public:
-    BufferSizeWatcher(Rations::AudioBackend &audio, Vst::IComponent *component,
-                      Vst::IAudioProcessor *processor, const Vst::ProcessSetup &setup,
-                      NAMp::host::ChainEngine &engine, NAMp::host::ChainBuilder &builder)
+    DeviceWatcher(Rations::AudioBackend &audio, Vst::IComponent *component,
+                  Vst::IAudioProcessor *processor, const Vst::ProcessSetup &setup,
+                  NAMp::host::ChainEngine &engine, NAMp::host::ChainBuilder &builder,
+                  const char *clientName, const Rations::MidiRoute *route)
         : mAudio(audio), mEngine(engine), mBuilder(builder), mComponent(component),
-          mProcessor(processor), mSetup(setup)
+          mProcessor(processor), mSetup(setup), mClientName(clientName), mRoute(route)
     {
     }
 
     void PLUGIN_API onTimer() SMTG_OVERRIDE
     {
-        const int size = mAudio.takeBufferSizeChange();
-        if (size <= 0)
-            return;
+        // The reset first: it may replace the device outright, and reconfiguring for a block size
+        // the old device reported would then be configuring for a device that is gone.
+        if (mAudio.takeDeviceReset())
+            reopen();
 
+        const int size = mAudio.takeBufferSizeChange();
+        if (size > 0)
+            reconfigure(mSetup.sampleRate, size);
+    }
+
+    // Called once, immediately after the device is first opened.
+    //
+    // WHY IT IS NEEDED AT ALL, given that setupProcessing has already been told a size. The figure
+    // it was told came from asking the device BEFORE opening it, and on one platform that answer is
+    // exact while on another it is an estimate: JACK and ASIO both state their size outright, but a
+    // WASAPI period can still move when the stream is actually initialised — exclusive mode clamps
+    // up to the device minimum, shared mode clamps into the engine's range, and an unaligned buffer
+    // is renegotiated. This is where the real figure lands.
+    //
+    // A WRONG ESTIMATE DEGRADES RATHER THAN BREAKS, which is why doing it here rather than before
+    // the first block is acceptable. The amp's own process() slices whatever it is handed into
+    // maxSamplesPerBlock-sized pieces, so a larger block is correct if slower; the chain engine
+    // refuses a block larger than it was prepared for and falls transparent, so the rack goes quiet
+    // for the one tick before this runs. Neither overruns a buffer.
+    void syncToDevice()
+    {
+        if (!mAudio.isOpen())
+            return;
+        // Drained, not acted on: whatever the backend may have queued is superseded by what it is
+        // actually running at, and applying both would reconfigure twice.
+        mAudio.takeBufferSizeChange();
+
+        const double rate = mAudio.sampleRate();
+        const int size = mAudio.blockSize();
+        if (size <= 0 || rate <= 0.0)
+            return;
+        if (size == mSetup.maxSamplesPerBlock && rate == mSetup.sampleRate)
+            return;
+        reconfigure(rate, size);
+    }
+
+private:
+    // The device went away and came back, or asked to be reopened — an ASIO driver whose control
+    // panel changed the buffer size, a device whose sample rate was changed underneath us, or a
+    // WASAPI endpoint that was invalidated by being unplugged. All three arrive as one flag.
+    //
+    // Reopening rather than reconfiguring in place is the driver's own contract: kAsioResetRequest
+    // means the driver must be stopped, disposed and started again, and an invalidated WASAPI
+    // client cannot be revived at all. Nothing here is on the audio thread — this is the run loop.
+    void reopen()
+    {
+        fprintf(stderr, "namp-rack: the audio device asked to be reopened\n");
+        mAudio.close();
+        if (!mAudio.open(mClientName, mProcessor, mComponent, mRoute)) {
+            fprintf(stderr,
+                    "namp-rack: the audio device did not come back; continuing without audio\n");
+            return;
+        }
+        // The replacement may be running at a different rate or block size from the one that left.
+        syncToDevice();
+        mAudio.notifyLatencyChanged();
+    }
+
+    void reconfigure(double rate, int size)
+    {
         if (!mAudio.suspendProcessing()) {
             fprintf(stderr,
                     "namp-rack: the audio thread did not respond, so the processor was left set "
@@ -193,12 +311,15 @@ public:
 
         Vst::ProcessSetup setup = mSetup;
         setup.maxSamplesPerBlock = size;
+        setup.sampleRate = rate;
         const bool ok = mProcessor->setupProcessing(setup) == kResultOk;
         if (ok)
             mSetup = setup;
         else
-            fprintf(stderr, "namp-rack: the plug-in refused %d frames; keeping %d\n", size,
-                    mSetup.maxSamplesPerBlock);
+            fprintf(stderr,
+                    "namp-rack: the plug-in refused %d frames at %.0f Hz; keeping %d at "
+                    "%.0f Hz\n",
+                    size, rate, mSetup.maxSamplesPerBlock, mSetup.sampleRate);
 
         mComponent->setActive(true);
         mProcessor->setProcessing(true);
@@ -216,31 +337,12 @@ public:
         mAudio.resumeProcessing(adopted);
         mAudio.notifyLatencyChanged();
 
-        printf("namp-rack: the audio buffer size is now %d frames\n", mAudio.blockSize());
+        printf("namp-rack: the audio device is now %.0f Hz, %d frames\n", mAudio.sampleRate(),
+               mAudio.blockSize());
         fflush(stdout);
     }
 
-    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
-    {
-        if (!obj)
-            return kInvalidArgument;
-        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
-            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
-            *obj = static_cast<Linux::ITimerHandler *>(this);
-            return kResultOk;
-        }
-        *obj = nullptr;
-        return kNoInterface;
-    }
-    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-    uint32 PLUGIN_API release() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-
+public:
 private:
     Rations::AudioBackend &mAudio;
     NAMp::host::ChainEngine &mEngine;
@@ -248,6 +350,10 @@ private:
     Vst::IComponent *mComponent = nullptr;
     Vst::IAudioProcessor *mProcessor = nullptr;
     Vst::ProcessSetup mSetup;
+    // What reopen() needs to open the device again. The route outlives this object: it is declared
+    // before the backend in main, for the same reason the backend reads it from the audio thread.
+    const char *mClientName = nullptr;
+    const Rations::MidiRoute *mRoute = nullptr;
 };
 
 //------------------------------------------------------------------------
@@ -264,7 +370,7 @@ private:
 //
 // Only slots whose sequence number has moved are forwarded, so the meters - which arrive every
 // block - do not turn into a redraw storm.
-class FeedbackPump : public Linux::ITimerHandler
+class FeedbackPump : public TimerHandler
 {
 public:
     FeedbackPump(Rations::AudioBackend &audio, Vst::IEditController *controller)
@@ -287,27 +393,6 @@ public:
             mSeen[i] = seq;
             mController->setParamNormalized(id, value);
         }
-    }
-
-    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
-    {
-        if (!obj)
-            return kInvalidArgument;
-        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
-            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
-            *obj = static_cast<Linux::ITimerHandler *>(this);
-            return kResultOk;
-        }
-        *obj = nullptr;
-        return kNoInterface;
-    }
-    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-    uint32 PLUGIN_API release() SMTG_OVERRIDE
-    {
-        return 1000;
     }
 
 private:
@@ -482,7 +567,7 @@ bool resolvePlugin(const NAMp::host::Catalog &catalog, const std::string &spec,
 // leaks nothing permanently — it just leaves retired snapshots and departed plug-ins alive until
 // something does collect — but with audio running and a chain being edited it is what keeps that
 // bounded.
-class ChainCollector : public Linux::ITimerHandler
+class ChainCollector : public TimerHandler
 {
 public:
     explicit ChainCollector(NAMp::host::ChainBuilder &builder) : mBuilder(builder)
@@ -492,27 +577,6 @@ public:
     void PLUGIN_API onTimer() SMTG_OVERRIDE
     {
         mBuilder.collect();
-    }
-
-    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
-    {
-        if (!obj)
-            return kInvalidArgument;
-        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
-            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
-            *obj = static_cast<Linux::ITimerHandler *>(this);
-            return kResultOk;
-        }
-        *obj = nullptr;
-        return kNoInterface;
-    }
-    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-    uint32 PLUGIN_API release() SMTG_OVERRIDE
-    {
-        return 1000;
     }
 
 private:
@@ -531,7 +595,7 @@ private:
 // So this churns as fast as the UI timer runs — publish, collect, publish — while the amp is
 // sounding, and the dropout count at the end is the answer. It runs on the run-loop thread, which
 // is where a rack edit comes from when a person does it, so the path under test is the real one.
-class RackStress : public Linux::ITimerHandler
+class RackStress : public TimerHandler
 {
 public:
     // `byEnable` toggles a node that stays loaded instead of adding and removing one. The two
@@ -591,27 +655,6 @@ public:
         ++mCycles;
     }
 
-    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
-    {
-        if (!obj)
-            return kInvalidArgument;
-        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
-            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
-            *obj = static_cast<Linux::ITimerHandler *>(this);
-            return kResultOk;
-        }
-        *obj = nullptr;
-        return kNoInterface;
-    }
-    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-    uint32 PLUGIN_API release() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-
 private:
     using Clock = std::chrono::steady_clock;
 
@@ -666,7 +709,7 @@ struct HostedEditor {
 //------------------------------------------------------------------------
 // The rack strip's own tick: repaint if anything asked, and keep the diagnostic cost bars measured
 // against the period the audio thread is actually running at.
-class RackTicker : public Linux::ITimerHandler
+class RackTicker : public TimerHandler
 {
 public:
     RackTicker(Rations::RackWindow &rack, Rations::AudioBackend &audio) : mRack(rack), mAudio(audio)
@@ -683,27 +726,6 @@ public:
         mRack.onTimer();
     }
 
-    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
-    {
-        if (!obj)
-            return kInvalidArgument;
-        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
-            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
-            *obj = static_cast<Linux::ITimerHandler *>(this);
-            return kResultOk;
-        }
-        *obj = nullptr;
-        return kNoInterface;
-    }
-    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-    uint32 PLUGIN_API release() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-
 private:
     Rations::RackWindow &mRack;
     Rations::AudioBackend &mAudio;
@@ -712,7 +734,7 @@ private:
 //------------------------------------------------------------------------
 // Drives every open hosted editor once per tick. Some formats need an idle callback to draw at all,
 // and a resize a plug-in latched from a thread we do not control is applied here.
-class EditorPump : public Linux::ITimerHandler
+class EditorPump : public TimerHandler
 {
 public:
     using Windows = std::vector<HostedEditor>;
@@ -734,27 +756,6 @@ public:
         }
     }
 
-    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
-    {
-        if (!obj)
-            return kInvalidArgument;
-        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
-            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
-            *obj = static_cast<Linux::ITimerHandler *>(this);
-            return kResultOk;
-        }
-        *obj = nullptr;
-        return kNoInterface;
-    }
-    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-    uint32 PLUGIN_API release() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-
 private:
     Windows &mWindows;
     Rations::RackWindow *mRack = nullptr;
@@ -762,11 +763,11 @@ private:
 
 //------------------------------------------------------------------------
 // Opens and closes every hosted editor over and over, which is the only way to prove the teardown
-// order holds. editorClose() -> removeWindow() -> XDestroyWindow() is load-bearing: destroy the X
+// order holds. editorClose() -> stop dispatching -> destroy the window is load-bearing: destroy the
 // window before telling the plug-in to close its editor and its timer fires against a window that
 // no longer exists, which is a crash inside somebody else's code with our stack nowhere in the
 // backtrace. Reading the source cannot show that; cycling it can.
-class EditorCycler : public Linux::ITimerHandler
+class EditorCycler : public TimerHandler
 {
 public:
     using Windows = std::vector<HostedEditor>;
@@ -815,27 +816,6 @@ public:
     int completedCycles() const
     {
         return mCycle;
-    }
-
-    tresult PLUGIN_API queryInterface(const TUID iid, void **obj) SMTG_OVERRIDE
-    {
-        if (!obj)
-            return kInvalidArgument;
-        if (FUnknownPrivate::iidEqual(iid, Linux::ITimerHandler::iid) ||
-            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
-            *obj = static_cast<Linux::ITimerHandler *>(this);
-            return kResultOk;
-        }
-        *obj = nullptr;
-        return kNoInterface;
-    }
-    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
-    {
-        return 1000;
-    }
-    uint32 PLUGIN_API release() SMTG_OVERRIDE
-    {
-        return 1000;
     }
 
 private:
@@ -912,14 +892,39 @@ struct Options {
     bool genericPanel = false;
 };
 
+// The two paragraphs that differ per platform: how the amp reaches the device, and how it is wired
+// to anything else. Everything between them is the same product and is written once.
+//
+// Split out rather than #ifdef'd inside one string because the JACK text is not merely inaccurate
+// on Windows — "a JACK server must already be running" would send a user looking for software that
+// has nothing to do with their machine.
+#if SMTG_OS_WINDOWS
+constexpr const char *kUsageIntro =
+    "  The amp head on its own: its own editor in a window of its own, with the amp on the\n"
+    "  audio device. ASIO first, because that is what interface drivers expose and what the\n"
+    "  latency depends on, and WASAPI when the machine has no ASIO driver. Without any device\n"
+    "  the editor still opens and everything but the sound works.\n";
+constexpr const char *kUsageWiring =
+    "  MIDI comes from one WinMM input, for a footswitch. Nothing is opened by default,\n"
+    "  because guessing which MIDI source is the pedal would be worse than not trying.\n";
+#else
+constexpr const char *kUsageIntro =
+    "  The amp head as a JACK application: its own editor in a window of its own, with the\n"
+    "  amp on JACK's ports. A JACK server must already be running; without one the editor\n"
+    "  still opens and everything but the sound works.\n";
+constexpr const char *kUsageWiring =
+    "  Ports: NAMp-Rack:in, NAMp-Rack:out_l, NAMp-Rack:out_r (connected to the first\n"
+    "  physical ports found) and NAMp-Rack:midi_in for a footswitch, which is left\n"
+    "  unconnected because guessing which MIDI source is the pedal would be worse than\n"
+    "  not trying.\n";
+#endif
+
 void printUsage()
 {
     const std::string path = statePath();
     printf("usage: namp-rack [options] [path to a .vst3 bundle]\n"
            "\n"
-           "  The amp head as a JACK application: its own editor in a window of its own, with the\n"
-           "  amp on JACK's ports. A JACK server must already be running; without one the editor\n"
-           "  still opens and everything but the sound works.\n"
+           "%s"
            "\n"
            "  The amp is built into this binary along with its art and fonts, so nothing has to\n"
            "  be installed. Naming a bundle hosts THAT plug-in instead, which is for driving a\n"
@@ -942,11 +947,8 @@ void printUsage()
            "  --no-state    do not read or write %s\n"
            "  -h, --help    this message\n"
            "\n"
-           "  Ports: NAMp-Rack:in, NAMp-Rack:out_l, NAMp-Rack:out_r (connected to the first\n"
-           "  physical ports found) and NAMp-Rack:midi_in for a footswitch, which is left\n"
-           "  unconnected because guessing which MIDI source is the pedal would be worse than\n"
-           "  not trying.\n",
-           path.empty() ? "the settings file" : path.c_str());
+           "%s",
+           kUsageIntro, path.empty() ? "the settings file" : path.c_str(), kUsageWiring);
 }
 
 // Run: carry on. Exit: the user asked for the usage message and got it. Error: they got it too,
@@ -1151,24 +1153,16 @@ int main(int argc, char **argv)
     Rations::MidiRoute route;
     route.resolve(controller);
 
-    // The one place a platform is named. Everything below this line talks to AudioBackend, so the
-    // Windows build changes this declaration and nothing else.
-    Rations::JackClient jackBackend;
-    Rations::AudioBackend &audio = jackBackend;
+    // Which platform's backend this is, is nativeaudio.h's business and nothing below this line's:
+    // everything from here on talks to AudioBackend.
+    Rations::NativeAudio nativeAudio;
+    Rations::AudioBackend &audio = nativeAudio;
 
-    // A first connection just to learn the server's rate and block size, so setupProcessing can be
-    // told the truth before the component is activated.
-    jack_status_t status = static_cast<jack_status_t>(0);
-    jack_client_t *probe = jack_client_open("NAMp-Rack-probe", JackNoStartServer, &status);
+    // What the device is already running at, so setupProcessing can be told the truth before the
+    // component is activated. False means there is no device at all, and the editor runs alone.
     double sampleRate = 48000.0;
     int blockSize = 1024;
-    if (probe) {
-        sampleRate = static_cast<double>(jack_get_sample_rate(probe));
-        blockSize = static_cast<int>(jack_get_buffer_size(probe));
-        jack_client_close(probe);
-    } else {
-        fprintf(stderr, "namp-rack: no JACK server; continuing with the editor only\n");
-    }
+    const bool haveDevice = nativeAudio.probeDefaults(sampleRate, blockSize);
 
     Vst::ProcessSetup setup = {};
     setup.processMode = Vst::kRealtime;
@@ -1281,21 +1275,32 @@ int main(int argc, char **argv)
 
     audio.setChainEngine(&chainEngine);
 
-    if (probe && !audio.open("NAMp-Rack", processor, component, &route))
+    if (haveDevice && !audio.open("NAMp-Rack", processor, component, &route))
         fprintf(stderr, "namp-rack: continuing without audio\n");
 
     // --- window and editor -------------------------------------------
-    ::Display *display = XOpenDisplay(nullptr);
-    if (!display) {
-        fprintf(stderr, "namp-rack: cannot open the X display\n");
+    // The loop and the frame are built BEFORE the window, which they do not touch until
+    // setEmbedding(): the frame is what knows how tall the strip under the editor is, and the
+    // window has to be created at editor-plus-strip or the first thing the user sees is a window
+    // that resizes itself. One loop for the process, one frame for this view — separate objects
+    // because the two interfaces have different multiplicities; see eventloop.h.
+    //
+    // The loop is FIRST of the three, so it is destroyed LAST: on the platform where it owns the
+    // connection to the display, closing that before the windows created against it would destroy
+    // their windows underneath them.
+    Rations::EventLoop eventLoop;
+    if (!eventLoop.isValid()) {
+        fprintf(stderr, "namp-rack: cannot open a connection to the display\n");
         return 1;
     }
+    Rations::EditorFrame frame(eventLoop);
+    Rations::RackWindow rack(eventLoop, chainBuilder);
 
     // The view is created before the window, so the window can be opened at the size the editor
     // actually wants rather than at a constant that would have to be kept in step with the panel.
     IPtr<IPlugView> view = owned(controller->createView(Vst::ViewType::kEditor));
-    if (view && view->isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) != kResultTrue) {
-        fprintf(stderr, "namp-rack: the plug-in has no X11 editor\n");
+    if (view && view->isPlatformTypeSupported(Rations::kNativePlatformType) != kResultTrue) {
+        fprintf(stderr, "namp-rack: the plug-in has no editor for this platform's windows\n");
         view = nullptr;
     }
 
@@ -1310,15 +1315,6 @@ int main(int argc, char **argv)
         }
     }
 
-    // The loop and the frame are built BEFORE the window, which they do not touch until
-    // setEmbedding(): the frame is what knows how tall the strip under the editor is, and the
-    // window has to be created at editor-plus-strip or the first thing the user sees is a window
-    // that resizes itself. One loop for the process, one frame for this view — separate objects
-    // because the two interfaces have different multiplicities; see eventloop.h.
-    Rations::EventLoop eventLoop(display);
-    Rations::EditorFrame frame(eventLoop);
-    Rations::RackWindow rack(eventLoop, chainBuilder);
-
     // The strip is laid out in the editor's own logical units and drawn at the editor's own scale,
     // which is what makes the two one picture rather than two that agree at 1.0 and nowhere else.
     // From here on the frame owns the whole window's shape: it grants the editor a height, works
@@ -1330,24 +1326,35 @@ int main(int argc, char **argv)
     const int winW = editorW;
     const int winH = editorH + frame.stripHeightFor(editorW);
 
-    const int screen = DefaultScreen(display);
-    ::Window window = XCreateSimpleWindow(
-        display, RootWindow(display, screen), 0, 0, static_cast<unsigned>(winW),
-        static_cast<unsigned>(winH), 0, BlackPixel(display, screen), BlackPixel(display, screen));
-    XStoreName(display, window, "NAMp Rack");
-    // So the desktop entry's StartupWMClass matches and the window gets the right icon.
-    XClassHint classHint = {};
-    char resName[] = "namp-rack";
-    char resClass[] = "NAMp Rack";
-    classHint.res_name = resName;
-    classHint.res_class = resClass;
-    XSetClassHint(display, window, &classHint);
-    XSelectInput(display, window, StructureNotifyMask | SubstructureNotifyMask);
+    // Input::StructureOnly: the editor draws every pixel inside this window and handles its own
+    // input, and the rack strip below it is a sibling child window that handles its own. What the
+    // top-level needs to be told about is the window manager resizing or closing it.
+    Rations::NativeWindow window(eventLoop);
+    if (!window.createTopLevel("NAMp Rack", winW, winH,
+                               Rations::NativeWindow::Input::StructureOnly)) {
+        fprintf(stderr, "namp-rack: cannot create the main window\n");
+        return 1;
+    }
+    // So the desktop entry's StartupWMClass matches and the window gets the right icon. Meaningful
+    // on X11 only; ignored elsewhere.
+    window.setClassHint("namp-rack", "NAMp Rack");
 
-    Atom wmDelete = XInternAtom(display, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(display, window, &wmDelete, 1);
-    XMapWindow(display, window);
-    XFlush(display);
+    // Registered before the window is shown and before the editor attaches: a view may ask to be
+    // resized from inside attached(), and that path needs the window already able to report.
+    //
+    // THE RESIZE BRANCH ONLY EVER SEES THIS WINDOW'S OWN SIZE, and that is the platform layer's
+    // doing rather than something this callback has to check. A resize reported against this window
+    // may be describing a CHILD's new size, and feeding that back as the top-level's is a measured
+    // infinite resize loop — 800x285 and 748x266 alternating forever. The filter that stops it now
+    // lives in one place instead of at every registration; see x11window.cpp.
+    window.setEventCallback([&](const Rations::WindowEvent &event) {
+        if (event.kind == Rations::WindowEvent::Kind::Close)
+            eventLoop.stop();
+        else if (event.kind == Rations::WindowEvent::Kind::Resize)
+            frame.windowConfigured(event.width, event.height);
+    });
+
+    window.show();
 
     gEventLoop = &eventLoop;
     std::signal(SIGINT, onSignal);
@@ -1355,8 +1362,7 @@ int main(int argc, char **argv)
 
     if (view) {
         view->setFrame(&frame);
-        if (view->attached(reinterpret_cast<void *>(static_cast<uintptr_t>(window)),
-                           kPlatformTypeX11EmbedWindowID) != kResultTrue) {
+        if (view->attached(window.systemWindow(), Rations::kNativePlatformType) != kResultTrue) {
             fprintf(stderr, "namp-rack: the editor refused to attach\n");
             view = nullptr;
         }
@@ -1370,7 +1376,7 @@ int main(int argc, char **argv)
     rack.setSearchPaths(&searchPathRows);
     rack.setPresets(&savedRacks);
     rack.setPresetName(rackName);
-    if (!rack.create(window, 0, editorH, winW, frame.stripHeightFor(winW)))
+    if (!rack.create(window.handle(), 0, editorH, winW, frame.stripHeightFor(winW)))
         fprintf(stderr, "namp-rack: the rack strip has no window; the amp still runs\n");
 
     // Only now: the run loop cannot resize a window the view has not attached to, and every page
@@ -1581,9 +1587,14 @@ int main(int argc, char **argv)
         eventLoop.registerTimer(&rackStress, kUiTickMs);
     }
 
-    BufferSizeWatcher blockWatcher(audio, component, processor, setup, chainEngine, chainBuilder);
-    if (audio.isOpen())
-        eventLoop.registerTimer(&blockWatcher, kUiTickMs);
+    DeviceWatcher deviceWatcher(audio, component, processor, setup, chainEngine, chainBuilder,
+                                "NAMp-Rack", &route);
+    if (audio.isOpen()) {
+        // Before the loop starts: the size setupProcessing was told is an estimate on one platform,
+        // and this is where the device's real figure replaces it. See syncToDevice.
+        deviceWatcher.syncToDevice();
+        eventLoop.registerTimer(&deviceWatcher, kUiTickMs);
+    }
 
     EditorCycler cycler(editorWindows, eventLoop, opt.editorCycles);
     if (opt.editorCycles > 0) {
@@ -1594,32 +1605,13 @@ int main(int argc, char **argv)
         eventLoop.registerTimer(&cycler, kUiTickMs);
     }
 
-    // Registered against THIS window rather than as a single global callback: the loop dispatches
-    // by XEvent::xany.window, so a second top-level cannot end up in the same handler.
-    //
-    // THE ConfigureNotify CHECK IS STILL NEEDED, and dropping it as redundant is a bug that
-    // presents as an infinite resize loop. Dispatch matches xany.window, which for a
-    // ConfigureNotify is the xconfigure.EVENT field — "window on which event was requested in event
-    // mask" (X11/Xlib.h) — and this window selected SubstructureNotifyMask, so it is also told when
-    // its CHILDREN resize. On those the event field is this window and matches, while
-    // xconfigure.window is the child and xconfigure.width/height are the CHILD's new size. Feeding
-    // that back as the top-level's size makes the editor resize its child to fit a size that was
-    // its child's, and the two then oscillate for as long as the program runs. Measured: 800x285
-    // and 748x266 alternating forever.
-    eventLoop.addWindow(window, [&](const XEvent &event) {
-        if (event.type == ClientMessage && static_cast<Atom>(event.xclient.data.l[0]) == wmDelete)
-            eventLoop.stop();
-        else if (event.type == ConfigureNotify && event.xconfigure.window == window)
-            frame.windowConfigured(event.xconfigure.width, event.xconfigure.height);
-    });
-
     eventLoop.run();
 
     // --- teardown ----------------------------------------------------
     if (opt.editorCycles > 0)
         eventLoop.unregisterTimer(&cycler);
     if (audio.isOpen())
-        eventLoop.unregisterTimer(&blockWatcher);
+        eventLoop.unregisterTimer(&deviceWatcher);
     if (opt.rackStressSeconds > 0.0)
         eventLoop.unregisterTimer(&rackStress);
     eventLoop.unregisterTimer(&editorPump);
@@ -1686,10 +1678,8 @@ int main(int argc, char **argv)
     controller->setComponentHandler(nullptr);
 
     // The window stops being dispatched to BEFORE it is destroyed, so nothing can be handed an
-    // event for a window id that no longer names anything.
-    eventLoop.removeWindow(window);
-    XDestroyWindow(display, window);
-    XCloseDisplay(display);
+    // event for a window that no longer names anything. Both are inside destroy(), in that order.
+    window.destroy();
     gEventLoop = nullptr;
     // The provider owns the component and the controller, and both must be gone before the module
     // that produced them is unloaded. Released here rather than left to scope exit, because

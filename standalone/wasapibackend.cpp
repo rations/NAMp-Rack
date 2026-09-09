@@ -1,6 +1,23 @@
 // WasapiBackend implementation. See wasapibackend.h for what is WASAPI's own, asiobackend.h for the
 // parts both Windows backends share, and audiobackend.h for the contract.
 
+// INITGUID FIRST, BEFORE EVERY INCLUDE, and it is load-bearing rather than conventional.
+//
+// This file names PKEY_Device_FriendlyName, the property key an endpoint's shown name is read from.
+// propkeydef.h's DEFINE_PROPERTYKEY only DECLARES a key unless INITGUID is set, and — measured, by
+// searching every archive in the MinGW sysroot for the symbol — nothing there defines it. Without
+// this the link fails with an undefined reference to it.
+//
+// WHAT MADE THAT WORTH A COMMENT is when it appeared. This backend is a static library, and a
+// static library's undefined references are not errors until something links it, so the file
+// compiled clean for as long as no executable used it. The Windows standalone is what finally did,
+// and the missing symbol surfaced there rather than here.
+//
+// Setting it in this file is safe, and would be safe in any number of files: with INITGUID the
+// macro emits the definition as DECLSPEC_SELECTANY, which is precisely the attribute that lets
+// duplicate definitions across translation units be merged rather than collide.
+#define INITGUID
+
 #include "wasapibackend.h"
 #include "pcmsamples.h"
 
@@ -20,6 +37,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <filesystem>
 #include <thread>
 
@@ -193,6 +211,82 @@ void fillFormat(WAVEFORMATEXTENSIBLE &out, int channels, double rate, int bits, 
 }
 
 } // namespace
+
+//------------------------------------------------------------------------
+// Main thread, before open. See the header for why the block size is an estimate.
+bool WasapiBackend::probeDefaults(double &sampleRate, int &blockSize)
+{
+    // Its own apartment, entered and left here, for the same reason enumerate() has one: this runs
+    // before the audio thread exists and must not depend on what the calling thread has done about
+    // COM. RPC_E_CHANGED_MODE means the thread is already in an apartment of the other kind, which
+    // is fine for a query.
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool ownCom = SUCCEEDED(com);
+
+    bool ok = false;
+    IMMDeviceEnumerator *enumerator = nullptr;
+    IMMDevice *device = nullptr;
+    IAudioClient *client = nullptr;
+    WAVEFORMATEX *mixFormat = nullptr;
+
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator),
+                                   reinterpret_cast<void **>(&enumerator))) &&
+        enumerator) {
+        // The saved endpoint if it is still there, the default otherwise — the same fallback open()
+        // makes, so the numbers reported here describe the device that will actually be opened.
+        if (!mSettings.renderDeviceId.empty()) {
+            try {
+                const std::wstring wide = std::filesystem::path(mSettings.renderDeviceId).wstring();
+                if (FAILED(enumerator->GetDevice(wide.c_str(), &device)))
+                    device = nullptr;
+            } catch (...) {
+                device = nullptr;
+            }
+        }
+        if (!device && FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)))
+            device = nullptr;
+
+        // ACTIVATED BUT NOT INITIALISED. Activate hands back a client object; it is Initialize that
+        // takes the device, and that is deliberately not called here.
+        if (device &&
+            SUCCEEDED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                       reinterpret_cast<void **>(&client))) &&
+            client) {
+            REFERENCE_TIME defaultPeriod = 0;
+            REFERENCE_TIME minimumPeriod = 0;
+            if (SUCCEEDED(client->GetDevicePeriod(&defaultPeriod, &minimumPeriod)) &&
+                SUCCEEDED(client->GetMixFormat(&mixFormat)) && mixFormat &&
+                mixFormat->nSamplesPerSec > 0 && defaultPeriod > 0) {
+                const double rate = static_cast<double>(mixFormat->nSamplesPerSec);
+                // Rounded UP: a block size is a buffer to be sized, and one frame short of the
+                // period is a buffer that overruns by one frame.
+                const double frames =
+                    std::ceil(rate * static_cast<double>(defaultPeriod) / kRefTimesPerSecond);
+                if (frames >= 1.0 && frames < 65536.0) {
+                    sampleRate = rate;
+                    blockSize = static_cast<int>(frames);
+                    ok = true;
+                }
+            }
+        }
+    }
+
+    if (mixFormat)
+        CoTaskMemFree(mixFormat);
+    if (client)
+        client->Release();
+    if (device)
+        device->Release();
+    if (enumerator)
+        enumerator->Release();
+    if (ownCom)
+        CoUninitialize();
+
+    if (!ok)
+        std::fprintf(stderr, "namp-rack: no usable WASAPI output endpoint to ask about\n");
+    return ok;
+}
 
 //------------------------------------------------------------------------
 // Main thread. Enumeration only: no stream is opened and no device is taken, so this is safe to

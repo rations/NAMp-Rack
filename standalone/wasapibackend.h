@@ -111,6 +111,22 @@ public:
     // an unplugged or disabled one is not something to offer.
     static bool enumerate(bool capture, std::vector<DeviceEntry> &out);
 
+    // What a stream on the configured render endpoint would run at, learned WITHOUT opening one:
+    // GetMixFormat and GetDevicePeriod both answer from an activated but UNINITIALISED
+    // IAudioClient, so nothing is taken from whatever is currently playing.
+    //
+    // THE BLOCK SIZE IS AN ESTIMATE AND NOT A GUARANTEE, unlike ASIO's, where the driver states its
+    // preferred size outright. The period this reports is the device's default one, and the size
+    // the stream actually ends up at can still differ: exclusive mode clamps up to the device
+    // minimum, shared mode on IAudioClient3 clamps into the engine's own range, and an unaligned
+    // buffer is renegotiated. The standalone reconciles the difference against the real figure the
+    // moment the device is open — see the note there on why a wrong estimate degrades rather than
+    // breaks.
+    //
+    // RENDER, NOT CAPTURE, because render is the master clock; see the two-clocks note at the top
+    // of this file.
+    bool probeDefaults(double &sampleRate, int &blockSize);
+
     void configure(const WasapiSettings &settings)
     {
         mSettings = settings;

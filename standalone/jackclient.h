@@ -41,6 +41,16 @@ class JackClient final : public AudioBackend
 public:
     ~JackClient() override;
 
+    // What the device is already running at, learned WITHOUT opening it, so that setupProcessing
+    // can be told the truth before the component is activated. False means there is no device to be
+    // had — no JACK server here — and the standalone continues with the editor only.
+    //
+    // This lives beside the backend rather than in the standalone because it is JACK knowledge: it
+    // opens a throwaway client purely to read two numbers off the server. Its Windows counterpart
+    // answers the same question from an entirely different place, which is exactly why the caller
+    // should not be the one asking. See nativeaudio.h.
+    bool probeDefaults(double &sampleRate, int &blockSize);
+
     // Connects to a running JACK server and starts processing. `processor` must already be set up
     // and activated, and `route` must already have been resolved: both are read from the audio
     // thread the moment the client is activated.
