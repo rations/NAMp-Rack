@@ -42,9 +42,9 @@ public:
     static constexpr size_t kMaxFileBytes = 256u * 1024u;
     static constexpr size_t kMaxLineBytes = 4096;
 
-    // $XDG_CONFIG_HOME/NAMp-Rack/pluginpaths, else $HOME/.config/NAMp-Rack/pluginpaths. Empty when
-    // neither variable resolves, in which case the list is usable for the session and simply not
-    // persisted.
+    // $XDG_CONFIG_HOME/NAMp-Rack/pluginpaths, else $HOME/.config/NAMp-Rack/pluginpaths, and on
+    // Windows %LOCALAPPDATA%\NAMp-Rack\pluginpaths. Empty when no variable resolves, in which case
+    // the list is usable for the session and simply not persisted.
     static std::string defaultFile();
 
     // Reads the file if it is there. A missing file is a first run, not an error; a malformed one

@@ -85,9 +85,10 @@ constexpr int64_t kNoMTime = INT64_MIN;
 int64_t newestMTime(const std::string &path, int depth = 8);
 
 // Where the cache lives: $XDG_CACHE_HOME/NAMp-Rack/plugincache, else
-// $HOME/.cache/NAMp-Rack/plugincache. Deliberately not beside the standalone's settings file — a
-// cache is regenerable and losing it costs one rescan, so it does not belong with configuration.
-// Returns empty if neither variable resolves.
+// $HOME/.cache/NAMp-Rack/plugincache, and on Windows %LOCALAPPDATA%\NAMp-Rack\plugincache.
+// Deliberately not beside the standalone's settings file — a cache is regenerable and losing it
+// costs one rescan, so it does not belong with configuration. Returns empty if no variable
+// resolves.
 std::string defaultCachePath();
 
 //------------------------------------------------------------------------
@@ -99,6 +100,12 @@ bool unescapeField(const std::string &in, std::string &out);
 //------------------------------------------------------------------------
 // Reject a path before anything is loaded from it. Absolute, no "..", no tab or newline (either
 // would corrupt a cache line), and bounded length.
+//
+// "Absolute" is per platform and is not the same test: a leading '/' on POSIX, and on Windows a
+// drive-absolute "C:\..." or a UNC "\\server\share\...". A Windows path that merely starts with a
+// separator, or with a drive letter and no separator, is REJECTED — what it resolves to depends on
+// the current directory or current drive of whichever process reads it, and these strings come back
+// out of files written by an earlier run.
 bool pathIsSafe(const std::string &path);
 
 } // namespace NAMp::host

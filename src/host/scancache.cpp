@@ -30,8 +30,28 @@ bool pathIsSafe(const std::string &path)
 {
     if (path.empty() || path.size() > kMaxPathLength)
         return false;
+#if defined(_WIN32)
+    // "C:\\..." or "\\\\server\\share\\...", and nothing else. A drive-RELATIVE path ("C:foo")
+    // and a root-relative one ("\\foo") are both rejected, because what each resolves to depends on
+    // the process's current directory or current drive at the moment it is used — and these strings
+    // are read back out of a cache file written by an earlier run, where neither was the same.
+    //
+    // Hand-written rather than std::filesystem::path::is_absolute(), and that is the same decision
+    // the resource-path helper documents at length: constructing a path from a narrow string throws
+    // std::filesystem::filesystem_error on libstdc++/MinGW when the bytes are not valid UTF-8, and
+    // every string reaching this function came out of an untrusted file.
+    const bool driveAbsolute =
+        path.size() >= 3 &&
+        ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+        path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+    const bool uncAbsolute = path.size() >= 2 && (path[0] == '\\' || path[0] == '/') &&
+                             (path[1] == '\\' || path[1] == '/');
+    if (!driveAbsolute && !uncAbsolute)
+        return false;
+#else
     if (path[0] != '/')
         return false;
+#endif
     if (path.find("..") != std::string::npos)
         return false;
     // A tab or newline in a path would split or terminate a cache row.
@@ -264,11 +284,27 @@ int64_t newestMTime(const std::string &path, int depth)
 //------------------------------------------------------------------------
 std::string defaultCachePath()
 {
+#if defined(_WIN32)
+    // %LOCALAPPDATA%, which is where a Windows application's own derived state belongs: it is
+    // per-user and per-machine, and it is the one that is NOT copied around by a roaming profile.
+    // That matters for exactly this file — a scan cache is keyed on absolute paths and modification
+    // times on THIS machine, so carrying it to another one could only ever produce wrong answers.
+    // The same reasoning puts the plug-in index and the search-path list there; neither has a
+    // meaning off the machine that wrote it.
+    //
+    // XDG is not consulted at all here. A Windows box that happens to have XDG_CACHE_HOME set has
+    // it because some ported tool put it there, pointing at a POSIX-shaped path that is not where
+    // this application's state goes.
+    if (const char *local = std::getenv("LOCALAPPDATA"); local && local[0])
+        return std::string(local) + "\\NAMp-Rack\\plugincache";
+    return {};
+#else
     if (const char *xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0])
         return std::string(xdg) + "/NAMp-Rack/plugincache";
     if (const char *home = std::getenv("HOME"); home && home[0])
         return std::string(home) + "/.cache/NAMp-Rack/plugincache";
     return {};
+#endif
 }
 
 } // namespace NAMp::host

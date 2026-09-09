@@ -16,6 +16,7 @@
 #include "pluginterfaces/vst/ivstunits.h"
 #include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/vstspeaker.h"
+#include "scancache.h" // pathIsSafe, whose notion of "absolute" is the platform's
 
 #include <chrono>
 #include <cstdio>
@@ -64,9 +65,12 @@ bool parseVst3Key(const std::string &key, std::string &bundlePath, std::string &
     bundlePath = key.substr(0, sep);
     uidString = key.substr(sep + 1);
 
-    if (bundlePath.empty() || bundlePath[0] != '/')
-        return false; // absolute paths only
-    if (bundlePath.find("..") != std::string::npos)
+    // pathIsSafe() rather than a test spelled out again here, because "absolute" is not the same
+    // string on both platforms: a key made on Windows begins "C:\\" or "\\\\server\\share", and a
+    // leading-'/' test would refuse every plug-in there — discovery would list them and nothing
+    // would ever load. That function is where the platform's answer lives, and it also rejects the
+    // "..", the tab and the newline this used to check for separately.
+    if (!pathIsSafe(bundlePath))
         return false;
     if (uidString.size() != kUidStringLength)
         return false;

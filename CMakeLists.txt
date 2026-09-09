@@ -190,6 +190,27 @@ if(NOT TARGET sdk)
 endif()
 
 # ---------------------------------------------------------------------------
+# Neutralise the SDK's Windows folder-icon step when cross-compiling.
+#
+# smtg_target_make_plugin_package() adds a POST_BUILD step that copies PlugIn.ico and desktop.ini
+# into the bundle and then runs "attrib +s" on all three paths. attrib is a cmd.exe built-in, not a
+# program, so it cannot exist on a Linux build host and the step fails the build outright. The SDK
+# offers no switch for it: SMTG_PACKAGE_ICON_PATH is forced back to the bundled Steinberg logo
+# inside smtg_add_vst3plugin_with_pkgname() whenever it does not name an existing file, so it cannot
+# be pointed at nothing.
+#
+# Redefining the function here — before smtg_add_vst3plugin() is called, so this is the definition
+# that call resolves to — replaces it without touching the pinned submodule. What is lost is only
+# the Explorer folder icon, which is cosmetic, is Steinberg's logo rather than ours, and does not
+# survive a ZIP in any case: the +s attribute is not carried by the archive format.
+# ---------------------------------------------------------------------------
+if(CMAKE_CROSSCOMPILING AND WIN32)
+    function(smtg_target_add_folder_icon target icon)
+        # Deliberately empty. See above.
+    endfunction()
+endif()
+
+# ---------------------------------------------------------------------------
 # Platform libraries
 # ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
@@ -265,18 +286,45 @@ endif()
 # ---------------------------------------------------------------------------
 # The graphics library: the hand-painted editor's Cairo/FreeType canvas.
 # ---------------------------------------------------------------------------
-pkg_check_modules(CAIROFT REQUIRED IMPORTED_TARGET cairo cairo-ft freetype2 fontconfig)
-if(NOT WIN32)
+if(WIN32)
+    # fontconfig is deliberately absent, and so is cairo-xlib. There is not one Fc* call in this
+    # tree — FontStack loads its two TTFs by path, and falls back to the copies linked into the
+    # binary — and cairo makes fontconfig optional on Windows, with cairo-ft.h guarding its
+    # fontconfig include behind CAIRO_HAS_FC_FONT. The Windows editor composes into the same
+    # offscreen image surface the X11 one does and blits it through a DIB section, so cairo needs
+    # its image backend, its FreeType font backend and PNG, and nothing else.
+    #
+    # These come from scripts/build-win-deps.sh; Debian packages no MinGW build of any of them.
+    # cmake/toolchain-mingw-w64.cmake points pkg-config at that prefix through PKG_CONFIG_LIBDIR.
+    #
+    # --static is required, and not merely for completeness. Everything in that sysroot is a static
+    # archive, and GNU ld resolves archives left to right in one pass: pkg-config's shared Libs:
+    # line orders them "-lz -lpng16", which is backwards for static linking and fails with
+    # undefined references to crc32/inflate/deflate out of libpng16.a. The --static line repeats
+    # -lz after -lpng16, which is exactly what the one-pass resolver needs.
+    set(PKG_CONFIG_ARGN --static)
+    pkg_check_modules(CAIROFT REQUIRED IMPORTED_TARGET cairo cairo-ft freetype2)
+
+    # cairo.h declares every entry point __declspec(dllimport) unless this is defined, and cairo's
+    # own .pc file does not carry it even for a static build — so without it every cairo call fails
+    # to link as "undefined reference to __imp_cairo_*". It belongs on the imported target rather
+    # than on ours, because it describes how cairo must be USED, and it has to reach every
+    # translation unit that includes a cairo header.
+    target_compile_definitions(PkgConfig::CAIROFT INTERFACE CAIRO_WIN32_STATIC_BUILD)
+
+    # What the window layer needs beyond cairo: GDI for the DIB blit, user32 for the window and its
+    # messages, msimg32 for AlphaBlend.
+    set(NAMPRACK_PLATFORM_GUI_LIBS user32 gdi32 msimg32)
+    set(NAMPRACK_PLATFORM_VIEW_SOURCES
+        ${NAMPRACK_ROOT}/src/platform/win32plugview.h
+        ${NAMPRACK_ROOT}/src/platform/win32plugview.cpp)
+else()
+    pkg_check_modules(CAIROFT REQUIRED IMPORTED_TARGET cairo cairo-ft freetype2 fontconfig)
     pkg_check_modules(CAIROX11 REQUIRED IMPORTED_TARGET cairo-xlib x11)
     set(NAMPRACK_PLATFORM_GUI_LIBS PkgConfig::CAIROX11)
     set(NAMPRACK_PLATFORM_VIEW_SOURCES
         ${NAMPRACK_ROOT}/src/platform/x11plugview.h
         ${NAMPRACK_ROOT}/src/platform/x11plugview.cpp)
-else()
-    set(NAMPRACK_PLATFORM_GUI_LIBS "")
-    set(NAMPRACK_PLATFORM_VIEW_SOURCES
-        ${NAMPRACK_ROOT}/src/platform/win32plugview.h
-        ${NAMPRACK_ROOT}/src/platform/win32plugview.cpp)
 endif()
 
 add_library(NampRackGfx STATIC
@@ -758,6 +806,14 @@ if(NAMPRACK_BUILD_TOOLS)
     # The allocation gate. Deliberately links NO graphics at all — it is measuring allocations on
     # the audio path, and a Cairo dependency would put an allocator on the link line that has no
     # business being counted.
+    #
+    # NOT BUILT FOR WINDOWS, and unlike namp_chaincheck there is nothing left of it if the harness is
+    # dropped: counting allocations is its entire job. The harness interposes malloc through
+    # dlsym(RTLD_NEXT) and its header includes <dlfcn.h>, and MinGW has neither, so this is a
+    # development-machine gate in the same sense ThreadSanitizer and live JACK are. The amp's audio
+    # path is platform-independent — the same channelrack, the same crossfade, the same chunk loop —
+    # so what this measures on Linux is what runs on Windows.
+    if(NOT WIN32)
     add_executable(rations_rtcheck
         ${NAMPRACK_ROOT}/tools/rations_rtcheck.cpp
         ${NAMPRACK_ROOT}/src/irblend.cpp
@@ -789,6 +845,7 @@ if(NAMPRACK_BUILD_TOOLS)
     # This costs nothing that matters. The tool is measuring WHETHER an allocation happens, not how
     # fast the audio path is, and the DSP it drives is in NampRackDsp and is still built at -O3.
     target_compile_options(rations_rtcheck PRIVATE -Wall -O0 -UNDEBUG)
+    endif()
 
     # The offline panel render: every page drawn without a host, which is the cheapest UI
     # regression test in the tree and the gate on every layout change.
@@ -848,12 +905,18 @@ if(NAMPRACK_BUILD_TOOLS)
     # interpose the process allocator, and the pair segfaults during startup with nothing printed —
     # measured, not guessed. The tool compiles either way and says which build it is; see the note
     # at the top of namp_chaincheck.cpp.
+    #
+    # It is left out of the WINDOWS build for a different reason with the same consequence: the
+    # harness interposes malloc through dlsym(RTLD_NEXT) and its header includes <dlfcn.h>, and MinGW
+    # has neither. The allocation gate is a development-machine gate, beside ThreadSanitizer and live
+    # JACK; what the Windows build of this tool is for is --routing and the preset round-trip, which
+    # is a Windows gate in its own right. The tool says which build it is either way.
     set(NAMPRACK_CHAINCHECK_SRC
         ${NAMPRACK_ROOT}/tools/namp_chaincheck.cpp
         ${NAMPRACK_ROOT}/src/host/hostiids.cpp
         ${VST3_SDK_DIR}/public.sdk/samples/vst-hosting/editorhost/source/usediids.cpp
     )
-    if(NOT NAMPRACK_ENABLE_TSAN)
+    if(NOT NAMPRACK_ENABLE_TSAN AND NOT WIN32)
         list(APPEND NAMPRACK_CHAINCHECK_SRC ${NAM_CORE_DIR}/tools/test/allocation_tracking.cpp)
     endif()
     add_executable(namp_chaincheck ${NAMPRACK_CHAINCHECK_SRC})

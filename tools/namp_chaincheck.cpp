@@ -24,6 +24,7 @@
 #include "host/chainengine.h"
 #include "host/hostapp.h"
 #include "host/pluginpaths.h"
+#include "host/scancache.h" // escapeField, for the hand-written path files below
 #include "host/rackpreset.h"
 
 #include "pluginterfaces/vst/ivstmessage.h"
@@ -37,13 +38,24 @@
 // globals its header declares right here, which lets everything else in this file compile and run
 // unchanged. What is lost is the allocation COUNT; what is being measured in that build is the
 // race, and the two questions were always separate tools in this tree.
-#include "test/allocation_tracking.h"
-
+//
+// THE WINDOWS BUILD TAKES THE SAME BRANCH, for a different reason with the same consequence: the
+// harness interposes malloc through dlsym(RTLD_NEXT) and its header includes <dlfcn.h>, neither of
+// which exists on MinGW. The allocation gate is a development-machine gate and always was — the
+// same place RULES puts ThreadSanitizer and live JACK. What the Windows build of this tool is for
+// is the routing check and the PRESET ROUND-TRIP, which is a phase-7 gate in its own right: a rack
+// saved on one platform has to come back on the other with every hosted parameter intact.
 #ifndef NAMPRACK_ALLOC_HARNESS
+#if defined(_WIN32)
+#define NAMPRACK_ALLOC_HARNESS 0
+#else
 #define NAMPRACK_ALLOC_HARNESS 1
 #endif
+#endif
 
-#if !NAMPRACK_ALLOC_HARNESS
+#if NAMPRACK_ALLOC_HARNESS
+#include "test/allocation_tracking.h"
+#else
 namespace allocation_tracking
 {
 volatile int g_allocation_count = 0;
@@ -957,31 +969,60 @@ int doRouting()
         PluginPaths paths;
         std::string error;
 
-        check(paths.add("/tmp", error), "an absolute directory is accepted");
-        check(!paths.add("/tmp", error) && error == "already in the list",
+        // THE CASES ARE SPELLED IN THE PLATFORM'S OWN PATHS, because what is under test is the RULE
+        // — absolute, no "..", no tab — and this platform's answer to "absolute" is part of the
+        // rule rather than a detail of the data. A Windows run against POSIX paths would refuse
+        // every row and pass every assertion for the wrong reason.
+#if defined(_WIN32)
+        const char *kDirA = "C:\\Windows";
+        const char *kDirB = "C:\\Windows\\System32";
+        const char *kDirBSlash = "C:\\Windows\\System32\\";
+        const char *kRelative = "Windows";
+        const char *kTraversal = "C:\\Windows\\..\\Users";
+        const char *kWithTab = "C:\\Windows\\with\ttab";
+        const char *kNoSuchDir = "C:\\no\\such\\directory\\at\\all";
+#else
+        const char *kDirA = "/tmp";
+        const char *kDirB = "/usr";
+        const char *kDirBSlash = "/usr/";
+        const char *kRelative = "tmp";
+        const char *kTraversal = "/tmp/../etc";
+        const char *kWithTab = "/tmp/with\ttab";
+        const char *kNoSuchDir = "/no/such/directory/at/all";
+#endif
+
+        check(paths.add(kDirA, error), "an absolute directory is accepted");
+        check(!paths.add(kDirA, error) && error == "already in the list",
               "...once, and the second attempt says why");
-        check(!paths.add("tmp", error), "a relative path is refused");
-        check(!paths.add("/tmp/../etc", error), "...as is one containing ..");
-        check(!paths.add("/tmp/with\ttab", error), "...and one carrying a tab, which is a field "
-                                                   "separator in the files this is written to");
-        check(!paths.add("/no/such/directory/at/all", error) && error == "not a directory",
+        check(!paths.add(kRelative, error), "a relative path is refused");
+        check(!paths.add(kTraversal, error), "...as is one containing ..");
+        check(!paths.add(kWithTab, error), "...and one carrying a tab, which is a field "
+                                           "separator in the files this is written to");
+        check(!paths.add(kNoSuchDir, error) && error == "not a directory",
               "a path that is not a directory is refused with the reason");
         check(paths.roots().size() == 1, "and none of the refusals left anything behind");
 
         // Trailing separators, because /usr/lib/vst3 and /usr/lib/vst3/ would otherwise be two rows
         // walking one tree — and only one of them would match the row the user clicked to remove.
         std::string canonicalError;
-        check(paths.add("/usr/", canonicalError) && paths.roots().back() == "/usr",
+        check(paths.add(kDirBSlash, canonicalError) && paths.roots().back() == kDirB,
               "a trailing separator is normalised away");
-        check(paths.remove("/usr"), "which is what makes the remove match");
-        check(!paths.remove("/usr"), "...and a second remove reports that there was nothing to do");
+        check(paths.remove(kDirB), "which is what makes the remove match");
+        check(!paths.remove(kDirB), "...and a second remove reports that there was nothing to do");
 
         // The file round-trip, including a path with the characters that would break the format if
-        // they were not escaped.
+        // they were not escaped. The scratch file goes wherever this platform keeps derived state,
+        // which is the same variable the real list is written under.
+#if defined(_WIN32)
+        const char *stateRoot = std::getenv("LOCALAPPDATA");
+        const std::string file =
+            std::string(stateRoot ? stateRoot : "C:\\Windows\\Temp") + "\\pluginpaths-check";
+#else
         const std::string file = std::string(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") +
                                  "/.cache/NAMp-Rack/pluginpaths-check";
+#endif
         PluginPaths saved;
-        check(saved.add("/tmp", error), "a list to save");
+        check(saved.add(kDirA, error), "a list to save");
         check(saved.save(file), "the list writes");
         PluginPaths loaded;
         check(loaded.load(file) && loaded.roots() == saved.roots(), "...and reads back identical");
@@ -991,18 +1032,23 @@ int doRouting()
         // is guessing at the meaning of a format that has not been written yet.
         {
             std::ofstream out(file, std::ios::trunc);
-            out << "#NAMPPATHS 99\n/tmp\n";
+            out << "#NAMPPATHS 99\n" << escapeField(kDirA) << '\n';
         }
         PluginPaths future;
         check(!future.load(file) && future.roots().empty(),
               "a version this build does not know is refused rather than partly honoured");
 
         {
+            // Written through escapeField() rather than by hand, because a Windows path IS a string
+            // full of the character the format escapes with: an unescaped "C:\\Windows" would come
+            // back as "C:Windows" and the row would be dropped for the wrong reason.
             std::ofstream out(file, std::ios::trunc);
-            out << "#NAMPPATHS 1\nnot-absolute\n/tmp/../escape\n/tmp\n";
+            out << "#NAMPPATHS 1\nnot-absolute\n"
+                << escapeField(std::string(kTraversal)) << '\n'
+                << escapeField(kDirA) << '\n';
         }
         PluginPaths mixed;
-        check(mixed.load(file) && mixed.roots().size() == 1 && mixed.roots()[0] == "/tmp",
+        check(mixed.load(file) && mixed.roots().size() == 1 && mixed.roots()[0] == kDirA,
               "unsafe rows are dropped and the rest of the file is still honoured");
 
         std::error_code ec;
@@ -1055,8 +1101,9 @@ int doRouting()
     // belongs to the plug-in, which we can name but not fix.
     std::printf("\nno allocation on the audio path, chain machinery only\n");
     if (!allocationHarnessBuilt()) {
-        std::printf("  skipped - this binary was built without the allocation harness, which "
-                    "cannot coexist with ThreadSanitizer. Every other check above still ran.\n");
+        std::printf("  skipped - this binary was built without the allocation harness: it cannot "
+                    "coexist with ThreadSanitizer, and MinGW has neither dlsym(RTLD_NEXT) nor "
+                    "<dlfcn.h> for it to interpose through. Every other check above still ran.\n");
     } else {
         if (!harnessHasTeeth())
             return 1;

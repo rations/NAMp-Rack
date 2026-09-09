@@ -558,6 +558,14 @@ bool applyRack(ChainBuilder &builder, const RackPreset &preset, const std::strin
 //------------------------------------------------------------------------
 std::string rackDir()
 {
+#if defined(_WIN32)
+    // %LOCALAPPDATA%, beside the scan cache and the search-path list — see defaultCachePath() in
+    // scancache.cpp for why that variable and not a roaming one. A saved rack names the absolute
+    // paths of the plug-ins it loads, so it has no meaning on another machine either.
+    if (const char *local = std::getenv("LOCALAPPDATA"); local && *local)
+        return std::string(local) + "\\NAMp-Rack\\racks";
+    return {};
+#else
     std::string base;
     if (const char *xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg)
         base = xdg;
@@ -566,6 +574,7 @@ std::string rackDir()
     else
         return {};
     return base + "/NAMp-Rack/racks";
+#endif
 }
 
 //------------------------------------------------------------------------
@@ -590,7 +599,14 @@ std::string rackPath(const std::string &name)
     const std::string dir = rackDir();
     if (dir.empty() || !rackNameIsSafe(name))
         return {};
+#if defined(_WIN32)
+    // The native separator, so the whole path reads as one Windows path rather than as a mixture.
+    // Win32 accepts either, but the directory above came back with backslashes and a saved rack's
+    // path is shown to the user.
+    return dir + "\\" + name + ".namprack";
+#else
     return dir + "/" + name + ".namprack";
+#endif
 }
 
 //------------------------------------------------------------------------

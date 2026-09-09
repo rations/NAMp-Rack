@@ -22,11 +22,22 @@ constexpr char kHeader[] = "#NAMPPATHS 1";
 //------------------------------------------------------------------------
 std::string PluginPaths::defaultFile()
 {
+#if defined(_WIN32)
+    // %LOCALAPPDATA%, for the reason spelled out at defaultCachePath() in scancache.cpp: it is the
+    // per-user, per-machine directory, and a list of absolute search roots means nothing on another
+    // machine. Windows keeps no separate config and cache roots, so the config/cache distinction
+    // this file's header draws — losing the cache costs a rescan, losing this loses something the
+    // user typed — survives only as the filename here.
+    if (const char *local = std::getenv("LOCALAPPDATA"); local && local[0])
+        return std::string(local) + "\\NAMp-Rack\\pluginpaths";
+    return {};
+#else
     if (const char *xdg = std::getenv("XDG_CONFIG_HOME"); xdg && xdg[0])
         return std::string(xdg) + "/NAMp-Rack/pluginpaths";
     if (const char *home = std::getenv("HOME"); home && home[0])
         return std::string(home) + "/.config/NAMp-Rack/pluginpaths";
     return {};
+#endif
 }
 
 //------------------------------------------------------------------------
@@ -131,10 +142,20 @@ bool PluginPaths::add(const std::string &dir, std::string &error)
     }
 
     // Trailing separators would make /usr/lib/vst3 and /usr/lib/vst3/ two different rows that walk
-    // the same tree, so the stored form is canonical.
+    // the same tree, so the stored form is canonical. Both separators are stripped on Windows,
+    // where either is accepted in a path and a folder chosen in the browser can carry either.
+    //
+    // The loop stops at size 3 there rather than 1, so "C:\\" keeps the separator that is what
+    // makes it absolute — pathIsSafe() would reject the "C:" it would otherwise be reduced to, and
+    // the root of a drive is a legitimate thing to point a scan at.
     std::string canonical = dir;
+#if defined(_WIN32)
+    while (canonical.size() > 3 && (canonical.back() == '\\' || canonical.back() == '/'))
+        canonical.pop_back();
+#else
     while (canonical.size() > 1 && canonical.back() == '/')
         canonical.pop_back();
+#endif
 
     for (const std::string &root : mRoots) {
         if (root == canonical) {

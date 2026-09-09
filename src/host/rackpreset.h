@@ -134,7 +134,8 @@ bool applyRack(ChainBuilder &builder, const RackPreset &preset, const std::strin
 //========================================================================
 // Files
 //------------------------------------------------------------------------
-// $XDG_CONFIG_HOME/NAMp-Rack/racks, or $HOME/.config/NAMp-Rack/racks. Empty when neither resolves.
+// $XDG_CONFIG_HOME/NAMp-Rack/racks, or $HOME/.config/NAMp-Rack/racks, and on Windows
+// %LOCALAPPDATA%\NAMp-Rack\racks. Empty when nothing resolves.
 std::string rackDir();
 
 // True for a name that is safe to turn into a filename: non-empty, at most 64 characters, no path
