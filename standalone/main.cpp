@@ -1088,6 +1088,15 @@ int main(int argc, char **argv)
     else
         printf("namp-rack: amp from %s\n", opt.bundle.c_str());
 
+#if defined(NAMPRACK_HAVE_ASIO) && NAMPRACK_HAVE_ASIO
+    // A LICENCE CONDITION, NOT A COURTESY. This build hosts ASIO drivers and the agreement requires
+    // the notice in the product, so it is printed whether or not an ASIO device is the one that
+    // ends up open — what obliges it is that the SDK is in the binary. Unconditional for the same
+    // reason: an attribution that only appeared on some runs would be an attribution the user might
+    // never see. See the constant for where the second copy of it goes.
+    printf("namp-rack: %s\n", Rations::kAsioTrademarkNotice);
+#endif
+
     // The host context must be published BEFORE the plug-in is instantiated:
     // ComponentBase::allocateMessage() asks it for IMessage instances, so without one every
     // controller->processor message (the four capture banks, the two IRs, Slim) is silently

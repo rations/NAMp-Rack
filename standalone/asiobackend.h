@@ -59,6 +59,26 @@ namespace Rations
 {
 
 //------------------------------------------------------------------------
+// THE ATTRIBUTION THE ASIO LICENCE REQUIRES IN THE SHIPPED PRODUCT, quoted exactly and not
+// paraphrased.
+//
+// The agreement's own words, for a product distributed as a download, are that "ASIO" and
+// Steinberg's notice — or the ASIO compatible logo and that notice — appear in an About box and/or
+// a startup screen and/or the bundled documentation. This project has no About box, so it takes the
+// other two: the standalone prints this line at startup, and the installer puts it in the
+// documentation it installs beside the binary.
+//
+// IT IS A CONSTANT RATHER THAN A LITERAL AT THE PRINT SITE so that there is one spelling of it in
+// the tree and a gate can check for that one. An attribution that drifted by a word would still
+// look right and would no longer be the string the agreement fixes.
+//
+// It is also why the product is never NAMED after it: "ASIO compatible" or "for ASIO" in regular
+// type is permitted, ASIO in a product or firm name is not.
+constexpr const char *kAsioTrademarkNotice =
+    "ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other "
+    "countries";
+
+//------------------------------------------------------------------------
 // What the setup page's picker chose. Separate from open() because R6's interface signature is
 // shared with JACK, which needs none of it: on Linux the server decides the rate and the block size
 // and the standalone reports what it was given, while on Windows the user picks and the choice has
