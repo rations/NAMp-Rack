@@ -134,6 +134,26 @@ public:
     // Main thread: adopt the new block size and let the audio callback back in.
     virtual void resumeProcessing(int blockSize) = 0;
 
+    // --- the device going away underneath us -------------------------------
+    // Main thread: the device asked to be reopened, or stopped existing. Taking it clears it.
+    //
+    // A BIGGER EVENT THAN A BUFFER-SIZE CHANGE, which is why it is not one. The three calls above
+    // reconfigure a processor while the same device keeps running; this says the device itself is
+    // no longer the one that was opened, and the only answer is close() and open() again — a new
+    // rate, a new block size, new channel counts, possibly a different piece of hardware. The
+    // caller does not need to know which of those changed.
+    //
+    // WHY IT IS ON THE INTERFACE AT ALL, given that JACK has no such event: two of the three
+    // backends this project will have do. An ASIO driver asks for exactly this through
+    // kAsioResetRequest, which is how it reports that its control panel changed something
+    // fundamental, and the request arrives on the DRIVER's thread while it is inside its own
+    // callback — there is nowhere to act on it but here. WASAPI's is AUDCLNT_E_DEVICE_INVALIDATED,
+    // returned from an ordinary call after the user unplugged the interface or changed the default
+    // device. JACK's nearest equivalent is the server going away, which it handles by shutting the
+    // client down rather than by asking anyone to reopen anything, so its implementation is a
+    // constant false.
+    virtual bool takeDeviceReset() = 0;
+
     // Main thread: queue a normalized parameter change for the next block. False means the ring is
     // full and the change was DROPPED, which is preferable to blocking either thread.
     virtual bool pushParameter(Steinberg::Vst::ParamID id, Steinberg::Vst::ParamValue value) = 0;

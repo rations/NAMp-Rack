@@ -72,6 +72,14 @@ public:
     bool suspendProcessing() override;
     void resumeProcessing(int blockSize) override;
 
+    // JACK has no reopen event. A server that goes away takes its clients with it — the process is
+    // told through jack_on_shutdown, not asked to open the device again — so there is nothing for
+    // this to report and a constant false is the honest answer rather than a stub.
+    bool takeDeviceReset() override
+    {
+        return false;
+    }
+
     bool pushParameter(Steinberg::Vst::ParamID id, Steinberg::Vst::ParamValue value) override;
 
     bool readFeedback(int index, Steinberg::Vst::ParamID &id, double &value,

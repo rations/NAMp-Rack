@@ -805,6 +805,78 @@ set_target_properties(NampRackRack PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_options(NampRackRack PRIVATE -Wall)
 
 # ---------------------------------------------------------------------------
+# NampRackWinAudio — the Windows audio backends and MIDI input.
+#
+# ITS OWN LIBRARY, AND BUILT BEFORE THE WINDOWS STANDALONE EXISTS TO LINK IT. Two reasons. The first
+# is that a file in no target is a file that rots: these compile against two SDKs and one of them is
+# not even in the repository, so they need to be built by every Windows configure rather than
+# discovered to be broken when the standalone is finally wired up. The second is the same one that
+# keeps NampRackHost free of X11 — a library that links no windowing and no VST3 plug-in code cannot
+# quietly grow a dependency on either.
+#
+# NO -ffast-math ON THIS TARGET, and the absence is asserted rather than reviewed, exactly as it is
+# on NampRackHost and for the same reason one layer further down. asiosamples.h's float-to-integer
+# conversion is the LAST place a NaN can be stopped before a float becomes a voltage, and it stops one
+# by testing positively for the in-range case; -ffinite-math-only tells the compiler NaN cannot
+# happen, which licenses it to treat that fallthrough as unreachable. The amp's own library IS built
+# with -ffast-math, which is why this has to be a separate target rather than a few more files in it.
+# ---------------------------------------------------------------------------
+if(WIN32)
+    set(NAMPRACK_WIN_AUDIO_SOURCES
+        ${NAMPRACK_ROOT}/standalone/audiobackend.h
+        ${NAMPRACK_ROOT}/standalone/asiosamples.h
+        ${NAMPRACK_ROOT}/standalone/winmmmidi.h
+        ${NAMPRACK_ROOT}/standalone/winmmmidi.cpp
+    )
+    if(NAMPRACK_WIN_ASIO)
+        list(APPEND NAMPRACK_WIN_AUDIO_SOURCES
+            ${NAMPRACK_ROOT}/standalone/asiobackend.h
+            ${NAMPRACK_ROOT}/standalone/asiobackend.cpp
+            # The SDK's own host side, compiled from the sysroot. Never reformatted and never
+            # patched — it built clean under MinGW as it stands, which was measured rather than
+            # assumed before anything was written against it.
+            ${NAMPRACK_ASIO_SOURCES})
+    endif()
+
+    add_library(NampRackWinAudio STATIC ${NAMPRACK_WIN_AUDIO_SOURCES})
+    target_include_directories(NampRackWinAudio
+        PUBLIC ${NAMPRACK_ROOT}/src ${NAMPRACK_ROOT}/standalone)
+    target_link_libraries(NampRackWinAudio PUBLIC NampRackHost sdk_hosting winmm)
+    target_compile_features(NampRackWinAudio PUBLIC cxx_std_17)
+    # -Wall on our files only; the SDK's sources are upstream text compiled as they are.
+    target_compile_options(NampRackWinAudio PRIVATE -Wall)
+
+    if(NAMPRACK_WIN_ASIO)
+        target_compile_definitions(NampRackWinAudio PUBLIC NAMPRACK_HAVE_ASIO=1)
+        # Two kinds of include, so two kinds of path. OUR files name the SDK's headers as
+        # "asiosdk/common/asio.h", which says where they came from and is a reminder at every use
+        # site that this tree does not contain them — that needs the directory ABOVE the SDK's own.
+        # The SDK's own sources include each other by bare name across its three directories, so
+        # those are on the path too: host/asiodrivers.h includes "asiolist.h", which is in host/pc.
+        get_filename_component(NAMPRACK_ASIO_SDK_PARENT "${NAMPRACK_ASIO_SDK_DIR}" DIRECTORY)
+        target_include_directories(NampRackWinAudio PRIVATE
+            ${NAMPRACK_ASIO_SDK_PARENT}
+            ${NAMPRACK_ASIO_SDK_DIR}
+            ${NAMPRACK_ASIO_SDK_DIR}/common
+            ${NAMPRACK_ASIO_SDK_DIR}/host
+            ${NAMPRACK_ASIO_SDK_DIR}/host/pc)
+        # ole32 for CoInitialize and CoCreateInstance: an ASIO driver is a COM object.
+        target_link_libraries(NampRackWinAudio PUBLIC ole32)
+    else()
+        target_compile_definitions(NampRackWinAudio PUBLIC NAMPRACK_HAVE_ASIO=0)
+    endif()
+
+    get_target_property(_namprack_winaudio_flags NampRackWinAudio COMPILE_OPTIONS)
+    if(_namprack_winaudio_flags MATCHES "ffast-math|ffinite-math-only")
+        message(FATAL_ERROR
+            "NampRackWinAudio carries ${_namprack_winaudio_flags}. asiosamples.h's conversion is "
+            "what stops a NaN from becoming a full-scale square wave at the device, and "
+            "-ffinite-math-only lets the compiler delete the test that does it. Whatever added that "
+            "flag has to exclude this target.")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Tools: the offline proofs and the panel render.
 # ---------------------------------------------------------------------------
 if(NAMPRACK_BUILD_TOOLS)
@@ -908,6 +980,27 @@ if(NAMPRACK_BUILD_TOOLS)
     # This costs nothing that matters. The tool is measuring WHETHER an allocation happens, not how
     # fast the audio path is, and the DSP it drives is in NampRackDsp and is still built at -O3.
     target_compile_options(rations_rtcheck PRIVATE -Wall -O0 -UNDEBUG)
+    endif()
+
+    # ---------------------------------------------------------------------------
+    # namp_audiocheck — the gate on the Windows audio path's arithmetic, run on LINUX.
+    #
+    # Built on every platform on purpose. The sample-format conversion the Windows backends do is
+    # pure arithmetic in a header that includes nothing of ASIO's, and no driver exists on the
+    # development machine to test it against — so the only way to check it before it reaches a user
+    # is to check it here. It links nothing at all: one header and the standard library, so a failure
+    # is the arithmetic and cannot be anything else.
+    # ---------------------------------------------------------------------------
+    add_executable(namp_audiocheck ${NAMPRACK_ROOT}/tools/namp_audiocheck.cpp)
+    target_include_directories(namp_audiocheck PRIVATE ${NAMPRACK_ROOT}/standalone)
+    target_compile_features(namp_audiocheck PRIVATE cxx_std_17)
+    target_compile_options(namp_audiocheck PRIVATE -Wall -Wextra)
+    # Same rule as NampRackWinAudio, and here it is the gate itself that would be defeated: with
+    # -ffinite-math-only the compiler may assume the NaN case away in the very code under test.
+    get_target_property(_namprack_audiocheck_flags namp_audiocheck COMPILE_OPTIONS)
+    if(_namprack_audiocheck_flags MATCHES "ffast-math|ffinite-math-only")
+        message(FATAL_ERROR "namp_audiocheck must not be built with fast math: it is the gate on "
+                            "what happens to a NaN.")
     endif()
 
     # The offline panel render: every page drawn without a host, which is the cheapest UI
