@@ -245,7 +245,10 @@ void JackClient::drainParameterRing()
 // block of jitter is under three milliseconds and no one can play tighter than that.
 void JackClient::readMidi(jack_nframes_t frames)
 {
-    if (!mMidiPort || !mRoute)
+    mRackMidiCount = 0;
+    // The rack wants the messages even when the amp has no route resolved for them: the amp's
+    // route says nothing about what a hosted pedal has learned.
+    if (!mMidiPort)
         return;
     void *buffer = jack_port_get_buffer(mMidiPort, frames);
     if (!buffer)
@@ -261,6 +264,21 @@ void JackClient::readMidi(jack_nframes_t frames)
         const int channel = event.buffer[0] & kMidiChannelMask;
         const int data1 = event.buffer[1] & 0x7f;
         const int data2 = event.size > 2 ? (event.buffer[2] & 0x7f) : 0;
+
+        // Kept whole for the rack before anything is decided about it, and keeping the frame JACK
+        // stamped it with rather than flattening it to 0 the way the amp's route below does — the
+        // amp reads one switch per block and cannot hear the difference, but a node deeper in the
+        // chain is entitled to be told when inside the block the message landed.
+        if (mRackMidiCount < NAMp::host::kMaxChunkMidi) {
+            NAMp::host::RtMidiEvent &m = mRackMidi[mRackMidiCount++];
+            m.frame = static_cast<int32_t>(event.time);
+            m.status = event.buffer[0];
+            m.data1 = static_cast<uint8_t>(data1);
+            m.data2 = static_cast<uint8_t>(data2);
+        }
+
+        if (!mRoute)
+            continue; // nothing decoded for the amp, but the rack already has it
 
         switch (status) {
             case kMidiControlChange: {
@@ -520,7 +538,7 @@ int JackClient::process(jack_nframes_t nframes)
     // Once per JACK cycle, never per chunk: adopting a chain mid-block would run the first chunk
     // with one topology and the rest with another.
     if (mChain)
-        mChain->beginBlock();
+        mChain->beginBlock(mRackMidi, mRackMidiCount);
 
     // Loop, never clamp. JACK's buffer size can change under a running client, and the processor
     // was set up for mBlockSize: handing it more would break that contract, and truncating to

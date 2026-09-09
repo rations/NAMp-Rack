@@ -141,6 +141,17 @@ private:
     Steinberg::Vst::IComponent *mComponent = nullptr;
     const MidiRoute *mRoute = nullptr;
 
+    // This cycle's MIDI kept UNDECODED for the rack, alongside the decode readMidi() does for the
+    // amp. The two cannot share a form: the amp's route is resolved against the amp's controller
+    // and answers only for the amp, while every hosted plug-in has a route of its own. So the amp
+    // gets its parameter writes as it always did and the rack gets the messages, and each opens the
+    // door that is actually its own.
+    //
+    // Fixed capacity, filled on the audio thread, read within the same callback. A cycle carrying
+    // more than kMaxChunkMidi drops the rest rather than growing.
+    NAMp::host::RtMidiEvent mRackMidi[NAMp::host::kMaxChunkMidi];
+    int32_t mRackMidiCount = 0;
+
     double mSampleRate = 48000.0;
     // Read by the audio thread, written by the UI thread on a size change.
     std::atomic<int> mBlockSize{1024};

@@ -21,10 +21,20 @@
 //     to restore into until then. ChainBuilder::loadNodeState is the one place that gets both ends
 //     of that right, and is what a preset load goes through.
 //
-// The interface deliberately has no MIDI, no transport and no instrument support. This is a guitar
-// rack: the chain carries audio and nothing else. Wet/dry mix and per-node enable are not
-// backend state either — they live in the chain snapshot, which is what lets a node at mix == 1.0
-// cost exactly nothing extra.
+// The interface carries MIDI but no transport and no instrument support. MIDI is here because the
+// pedals that ship beside this host are STOMPBOXES: each has its own MIDI-learn row and its whole
+// reason to exist is being switched by a foot, and a rack that delivers a footswitch to the amp and
+// not to the pedals in front of it is a pedalboard with half its cabling missing. It is delivered
+// as AudioBlock::midi — undecoded, because the door differs per format (see RtMidiEvent) — and
+// every hosted node is offered every message, exactly as the amp is. Filtering is the plug-in's
+// own business: a learned binding is what says which message is for it, and that lives inside the
+// plug-in where the user set it, not in a routing matrix here.
+//
+// Transport and instrument support stay out. This is still a guitar rack: nothing in it needs a bar
+// line, and a node that wants to be played rather than driven is a different product.
+//
+// Wet/dry mix and per-node enable are not backend state either — they live in the chain snapshot,
+// which is what lets a node at mix == 1.0 cost exactly nothing extra.
 
 #pragma once
 

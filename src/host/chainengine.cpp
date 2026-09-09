@@ -48,6 +48,15 @@ bool ChainEngine::prepare(int32_t maxBlock)
     mScratch.assign(total, 0.0f);
     mMaxBlock = maxBlock;
 
+    // The one MIDI allocation, here and nowhere else. assign() rather than resize() so a re-prepare
+    // at a new block size leaves no stale message behind to be replayed into the first chunk.
+    mChunkMidiBuf.assign(static_cast<size_t>(kMaxChunkMidi), RtMidiEvent{});
+    mMidi = nullptr;
+    mMidiCount = 0;
+    mBlockPos = 0;
+    mChunkMidi = nullptr;
+    mChunkMidiCount = 0;
+
     for (int8_t slot = 0; slot < kScratchSlotCount; ++slot) {
         for (int32_t c = 0; c < kMaxChainChannels; ++c) {
             const size_t offset =
@@ -94,8 +103,13 @@ void ChainEngine::abandon()
 
 //------------------------------------------------------------------------
 // Audio thread.
-void ChainEngine::beginBlock() noexcept
+void ChainEngine::beginBlock(const RtMidiEvent *midi, int32_t midiCount) noexcept
 {
+    // Borrowed for the cycle. Nothing is copied here; the slicing happens per chunk.
+    mMidi = (midi && midiCount > 0) ? midi : nullptr;
+    mMidiCount = mMidi ? midiCount : 0;
+    mBlockPos = 0;
+
     // A snapshot that could not be handed back last time takes priority: until it is gone, adopting
     // another would mean holding two dead chains with nowhere to put the second.
     if (mHoldover && mRetire.push(mHoldover))
@@ -158,6 +172,10 @@ void ChainEngine::runSection(const RtNode *nodes, int32_t count, int32_t frames)
         block.out = mSlot[node.outSlot];
         block.channels = node.channels;
         block.frames = frames;
+        // Every node is offered every message. Which one is for it is a question only the plug-in
+        // can answer, because the answer is the binding its user taught it.
+        block.midi = mChunkMidi;
+        block.midiCount = mChunkMidiCount;
         node.backend->process(block);
 
         if (blend) {
@@ -174,11 +192,43 @@ void ChainEngine::runSection(const RtNode *nodes, int32_t count, int32_t frames)
 }
 
 //------------------------------------------------------------------------
+// Audio thread. Narrow the cycle's MIDI to [mBlockPos, mBlockPos + frames) and rebase it, so a node
+// sees offsets measured from the chunk it is actually being given.
+//
+// Linear from the start of the cycle rather than a running cursor: the list is ordered and tiny —
+// nearly always empty, and a stomp makes it one long — so the scan costs less than the state it
+// would take to avoid it, and it cannot be left inconsistent by a chunk that returned early.
+void ChainEngine::sliceMidi(int32_t frames) noexcept
+{
+    mChunkMidi = nullptr;
+    mChunkMidiCount = 0;
+    if (!mMidi || frames <= 0 || mChunkMidiBuf.empty())
+        return;
+
+    const int32_t first = mBlockPos;
+    const int32_t last = mBlockPos + frames; // exclusive
+    int32_t n = 0;
+    for (int32_t i = 0; i < mMidiCount && n < static_cast<int32_t>(mChunkMidiBuf.size()); ++i) {
+        const RtMidiEvent &e = mMidi[i];
+        if (e.frame < first || e.frame >= last)
+            continue;
+        mChunkMidiBuf[static_cast<size_t>(n)] = e;
+        mChunkMidiBuf[static_cast<size_t>(n)].frame = e.frame - first;
+        ++n;
+    }
+    if (n > 0) {
+        mChunkMidi = mChunkMidiBuf.data();
+        mChunkMidiCount = n;
+    }
+}
+
+//------------------------------------------------------------------------
 // Audio thread.
 void ChainEngine::beginChunk(const float *in, float *outL, float *outR, int32_t frames,
                              ChainIo &io) noexcept
 {
     mFrames = frames;
+    sliceMidi(frames);
 
     io.anchorIn = in;
     io.anchorOut[0] = outL;
@@ -212,6 +262,11 @@ void ChainEngine::beginChunk(const float *in, float *outL, float *outR, int32_t 
 // Audio thread.
 void ChainEngine::endChunk() noexcept
 {
+    // Advance past this chunk whatever happens below: a chunk the engine stayed transparent for
+    // still consumed its share of the block, and leaving the cursor behind would replay its
+    // messages into the next one.
+    mBlockPos += mFrames > 0 ? mFrames : 0;
+
     const RtChain *chain = mLive;
     if (!chain || mFrames <= 0 || mFrames > mMaxBlock)
         return;

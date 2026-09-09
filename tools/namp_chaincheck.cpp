@@ -112,11 +112,12 @@ class ArithmeticBackend final : public PluginBackend
 {
 public:
     enum class Mode {
-        AddOffset, // out = in + offset
-        EmitNaN,   // out = NaN, whatever the input was
-        EmitLoud,  // out = 100.0
-        Silent,    // writes nothing at all: a plug-in that leaves its output bus alone
-        Delay,     // out = in delayed by `latency` samples: a plug-in that is honestly late
+        AddOffset,  // out = in + offset
+        EmitNaN,    // out = NaN, whatever the input was
+        EmitLoud,   // out = 100.0
+        Silent,     // writes nothing at all: a plug-in that leaves its output bus alone
+        Delay,      // out = in delayed by `latency` samples: a plug-in that is honestly late
+        RecordMidi, // passes audio through and keeps every message it was handed, with its offset
     };
 
     // `reportLatency == false` makes the node delay its output by `latency` samples while telling
@@ -189,6 +190,16 @@ public:
         if (mMode == Mode::Silent)
             return;
 
+        if (mMode == Mode::RecordMidi) {
+            for (int32_t i = 0; i < block.midiCount; ++i)
+                mMidiSeen.push_back(block.midi[i]);
+            mChunkCounts.push_back(block.midiCount);
+            for (int32_t c = 0; c < block.channels; ++c)
+                std::memcpy(block.out[c], block.in[c],
+                            sizeof(float) * static_cast<size_t>(block.frames));
+            return;
+        }
+
         if (mMode == Mode::Delay) {
             const int32_t len = static_cast<int32_t>(mLatency);
             if (len <= 0) {
@@ -225,6 +236,8 @@ public:
                         break;
                     case Mode::EmitNaN:
                         out[s] = std::nanf("");
+                        break;
+                    case Mode::RecordMidi: // handled whole-block above; never reached per sample
                         break;
                     case Mode::EmitLoud:
                         out[s] = 100.0f;
@@ -342,6 +355,13 @@ public:
         return mChannels;
     }
 
+    // RecordMidi's evidence, public because reading it IS the check. Vectors on purpose: this is a
+    // check tool's own bookkeeping, not the audio path being measured, and push_back here would
+    // fail the RT gate if RecordMidi were ever used in --rt. It is not — the allocation harness
+    // runs against AddOffset chains.
+    std::vector<RtMidiEvent> mMidiSeen;
+    std::vector<int32_t> mChunkCounts;
+
 private:
     Mode mMode;
     float mOffset = 0.0f;
@@ -369,6 +389,29 @@ void runBlock(ChainEngine &engine, const float *in, float *outL, float *outR, in
         io.anchorOut[1][s] = v;
     }
     engine.endChunk();
+}
+
+//------------------------------------------------------------------------
+// The same block, driven as `chunks` equal chunks, with the cycle's MIDI handed to beginBlock the
+// way the JACK client hands it over. Separate from runBlock because the thing being checked is what
+// each CHUNK is given, which a single-chunk block cannot show.
+void runBlockChunked(ChainEngine &engine, const float *in, float *outL, float *outR, int32_t frames,
+                     int32_t chunks, const RtMidiEvent *midi, int32_t midiCount)
+{
+    engine.beginBlock(midi, midiCount);
+
+    const int32_t n = frames / chunks;
+    for (int32_t c = 0; c < chunks; ++c) {
+        const int32_t off = c * n;
+        ChainIo io;
+        engine.beginChunk(in + off, outL + off, outR + off, n, io);
+        for (int32_t s = 0; s < n; ++s) {
+            const float v = io.anchorIn[s];
+            io.anchorOut[0][s] = v;
+            io.anchorOut[1][s] = v;
+        }
+        engine.endChunk();
+    }
 }
 
 //------------------------------------------------------------------------
@@ -515,6 +558,83 @@ int doRouting()
               "pre-section nodes are configured mono");
         check(f.builder.backend(ChainSection::Post, 0)->audioInCount() == 2,
               "post-section nodes are configured stereo");
+    }
+
+    std::printf("\nMIDI reaches every node, sliced to the chunk it belongs in\n");
+    {
+        // Four chunks of kBlock/4. Four messages, one landing in each chunk, plus one past the end
+        // of the block that must never be delivered at all.
+        Fixture f;
+        f.addArithmetic(ChainSection::Pre, ArithmeticBackend::Mode::RecordMidi, 0.0f);
+        f.addArithmetic(ChainSection::Post, ArithmeticBackend::Mode::RecordMidi, 0.0f);
+        f.builder.publish();
+
+        const int32_t chunks = 4;
+        const int32_t n = kBlock / chunks;
+        const RtMidiEvent midi[5] = {
+            {0, 0xb0, 80, 127},            // chunk 0, first sample
+            {n + 5, 0xb0, 81, 127},        // chunk 1
+            {2 * n + 17, 0x90, 60, 100},   // chunk 2
+            {3 * n + (n - 1), 0xc0, 3, 0}, // chunk 3, last sample
+            {kBlock + 40, 0xb0, 82, 127},  // past the end of the cycle: never delivered
+        };
+        f.fill(0.0f);
+        runBlockChunked(f.engine, f.in.data(), f.outL.data(), f.outR.data(), kBlock, chunks, midi,
+                        5);
+
+        // Both sections, because they are run by different calls — the pre section inside
+        // beginChunk and the post section inside endChunk — and a slice that is right for one is
+        // not thereby right for the other.
+        for (const ChainSection section : {ChainSection::Pre, ChainSection::Post}) {
+            const auto *node =
+                static_cast<const ArithmeticBackend *>(f.builder.backend(section, 0));
+            const char *where = (section == ChainSection::Pre) ? "pre " : "post";
+            char label[128];
+
+            std::snprintf(label, sizeof(label), "%s: four of the five messages arrived", where);
+            check(node->mMidiSeen.size() == 4, label);
+            if (node->mMidiSeen.size() != 4)
+                continue;
+
+            std::snprintf(label, sizeof(label), "%s: the one past the block's end did not", where);
+            bool leaked = false;
+            for (const RtMidiEvent &e : node->mMidiSeen)
+                leaked = leaked || e.data1 == 82;
+            check(!leaked, label);
+
+            std::snprintf(label, sizeof(label), "%s: one message per chunk, in order", where);
+            check(node->mChunkCounts.size() == static_cast<size_t>(chunks) &&
+                      node->mChunkCounts[0] == 1 && node->mChunkCounts[1] == 1 &&
+                      node->mChunkCounts[2] == 1 && node->mChunkCounts[3] == 1,
+                  label);
+
+            // The whole point of the rebase: a node is given the chunk it is running, so an offset
+            // measured from the block would be past the end of three chunks out of four.
+            std::snprintf(label, sizeof(label), "%s: offsets rebased to the chunk", where);
+            check(node->mMidiSeen[0].frame == 0 && node->mMidiSeen[1].frame == 5 &&
+                      node->mMidiSeen[2].frame == 17 && node->mMidiSeen[3].frame == n - 1,
+                  label);
+
+            std::snprintf(label, sizeof(label), "%s: status and data bytes intact", where);
+            check(node->mMidiSeen[0].status == 0xb0 && node->mMidiSeen[0].data1 == 80 &&
+                      node->mMidiSeen[0].data2 == 127 && node->mMidiSeen[2].status == 0x90 &&
+                      node->mMidiSeen[3].status == 0xc0,
+                  label);
+        }
+    }
+
+    std::printf("\na cycle with no MIDI hands nodes nothing at all\n");
+    {
+        Fixture f;
+        f.addArithmetic(ChainSection::Pre, ArithmeticBackend::Mode::RecordMidi, 0.0f);
+        f.builder.publish();
+        f.fill(0.0f);
+        f.run();
+        const auto *node =
+            static_cast<const ArithmeticBackend *>(f.builder.backend(ChainSection::Pre, 0));
+        check(node->mMidiSeen.empty(), "nothing delivered");
+        check(node->mChunkCounts.size() == 1 && node->mChunkCounts[0] == 0,
+              "and the count really was zero, not merely unread");
     }
 
     std::printf("\nJACK's input buffer is read-only\n");

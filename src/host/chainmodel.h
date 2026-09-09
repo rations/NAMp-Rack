@@ -41,6 +41,14 @@ constexpr int32_t kMaxChainNodes = 32;
 // The chain never carries more than a stereo pair. This is a guitar pedalboard.
 constexpr int32_t kMaxChainChannels = 2;
 
+// The most MIDI messages one JACK cycle may carry into the rack. A foot on a switch produces one;
+// a controller sweeping a CC at its fastest produces a few dozen a second, which at 48 kHz and 128
+// frames is well under one per cycle. 256 is therefore not a limit anyone plays into - it is the
+// number that makes the engine's per-chunk buffer a fixed allocation made in prepare(), because the
+// alternative is growing a vector on the audio thread. Overflow drops the tail of the cycle and is
+// counted, never grown into.
+constexpr int32_t kMaxChunkMidi = 256;
+
 //------------------------------------------------------------------------
 // Bus slots. The first four are scratch owned by ChainEngine; the last two are aliases for JACK's
 // own memory and are refilled every chunk.

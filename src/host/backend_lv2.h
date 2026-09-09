@@ -204,6 +204,10 @@ private:
         // Atom ports only.
         uint32_t bufferSize = 0;
         bool carriesMidiOnly = false;
+        // Will take midi:MidiEvent, whether or not it takes anything else. See the note where it
+        // is set: this and carriesMidiOnly answer different questions and a port can accept MIDI
+        // without carrying only MIDI.
+        bool acceptsMidi = false;
 
         char name[128] = {};
         char symbol[64] = {};
@@ -326,6 +330,7 @@ private:
     uint32_t mUridAtomChunk = 0;
     uint32_t mUridAtomSequence = 0;
     uint32_t mUridAtomEventTransfer = 0;
+    uint32_t mUridMidiEvent = 0;
     uint32_t mUridFloat = 0;
 
     //--- editor ----------------------------------------------------------

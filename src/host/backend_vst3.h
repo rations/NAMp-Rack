@@ -57,6 +57,7 @@
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "public.sdk/source/vst/hosting/eventlist.h"
 #include "pluginterfaces/gui/iplugview.h"
 
 #include <atomic>
@@ -146,9 +147,11 @@ public:
     //--- editor --------------------------------------------------------
     EditorKind editorKind() const override;
     bool editorOpen(const EditorOpenRequest &request, EditorSurface &out) override;
-    void editorIdle() override
-    {
-    }
+    // Not empty, and what it does is not drawing. A VST3 editor draws itself; what it cannot do is
+    // notice that its own processor moved a parameter, because the two halves never speak directly.
+    // See paramPollFromRt: draining is what carries the value across, and while a plug-in's own
+    // editor is the window on screen this is the only thing calling it.
+    void editorIdle() override;
     bool editorTakeResizeRequest(int32_t &w, int32_t &h) override;
     bool editorCheckSize(int32_t &w, int32_t &h) const override;
     void editorSetSize(int32_t w, int32_t h) override;
@@ -212,6 +215,78 @@ private:
         Vst3Backend &mOwner;
     };
 
+    //--------------------------------------------------------------------
+    // Where each kind of MIDI message has to be delivered to THIS plug-in, worked out once on the
+    // owning thread. Ported from the amp standalone's own MidiRoute, which had to answer the same
+    // question for the amp, and kept per instance because every answer here is a property of one
+    // plug-in: two pedals in the same rack map the same controller number onto different parameters
+    // and neither is wrong.
+    //
+    // The three things a footswitch sends do NOT arrive at a VST3 plug-in by the same route, and
+    // only one of them is still MIDI by the time it lands:
+    //
+    //   * Control Change  -> a PARAMETER change, on the parameter IMidiMapping names for that
+    //                        controller number. The MIDI channel is gone by then.
+    //   * Program Change  -> a PARAMETER change too, on the parameter carrying kIsProgramChange in
+    //                        the unit IUnitInfo::getUnitByBus names for the incoming channel.
+    //   * Note On / Off   -> an EVENT, in ProcessData::inputEvents, still carrying its channel.
+    //
+    // Both lookups are IEditController calls and the audio thread may never make one, so they are
+    // resolved in prepare() and what the audio thread gets afterwards is an array subscript.
+    //
+    // A plug-in offering neither interface is not an error. The affected route is simply dead and
+    // the others still work, which is also what happens in a DAW.
+    struct MidiRoute {
+        static constexpr int kChannels = 16;
+        static constexpr int kControllers = 128;
+
+        void resolve(Steinberg::Vst::IEditController *controller);
+
+        // The parameter a Control Change lands on, or kNoParamId if none does.
+        Steinberg::Vst::ParamID ccParam(int channel, int cc) const
+        {
+            if (channel < 0 || channel >= kChannels || cc < 0 || cc >= kControllers)
+                return Steinberg::Vst::kNoParamId;
+            return mCc[channel][cc];
+        }
+
+        // The parameter a Program Change lands on, or kNoParamId.
+        Steinberg::Vst::ParamID programParam(int channel) const
+        {
+            if (channel < 0 || channel >= kChannels)
+                return Steinberg::Vst::kNoParamId;
+            return mProgram[channel].id;
+        }
+
+        // A program number as that parameter's normalized value. The denominator is the list's own
+        // length, read from the plug-in rather than assumed to be 128, because it is the plug-in
+        // that decides how long its program list is.
+        double programValue(int channel, int program) const;
+
+        bool routesAnything() const
+        {
+            return mHasCc || mHasProgram;
+        }
+
+        struct Program {
+            Steinberg::Vst::ParamID id = Steinberg::Vst::kNoParamId;
+            Steinberg::int32 count = 0;
+        };
+
+        // kNoParamId is 0xffffffff rather than 0, so these cannot be left to zero-initialise:
+        // "no destination" has to be written in explicitly or every controller number would appear
+        // to be mapped to parameter 0. clear() is what writes it.
+        void clear();
+
+        Steinberg::Vst::ParamID mCc[kChannels][kControllers] = {};
+        Program mProgram[kChannels] = {};
+        bool mHasCc = false;
+        bool mHasProgram = false;
+    };
+
+    // Audio thread. Open whichever of the three doors each message belongs to.
+    void deliverMidi(const AudioBlock &block) noexcept;
+
     // Index of the parameter carrying `id`, or mParams.size() if the plug-in named one it never
     // published. A plug-in is entitled to do that and it must not be a crash.
     size_t indexOfParamId(Steinberg::Vst::ParamID id) const;
@@ -257,6 +332,12 @@ private:
     Steinberg::Vst::ParameterChanges mOutputChanges;
     Steinberg::Vst::ParameterChangeTransfer mToRt;
     Steinberg::Vst::ParameterChangeTransfer mFromRt;
+
+    //--- MIDI ------------------------------------------------------------
+    MidiRoute mMidiRoute;
+    // Notes are the one message type that stays an event. Sized in prepare(); addEvent() on a full
+    // list is a drop, never a growth, which is what keeps this off the allocator.
+    Steinberg::Vst::EventList mEvents;
 
     //--- parameters -----------------------------------------------------
     struct Param {

@@ -11,7 +11,10 @@
 #include "public.sdk/source/common/memorystream.h"
 #include "public.sdk/source/vst/utility/stringconvert.h"
 #include "pluginterfaces/vst/ivstmessage.h"
+#include "chainmodel.h" // kMaxChunkMidi: the engine's ceiling on messages per cycle
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
+#include "pluginterfaces/vst/ivstunits.h"
+#include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/vstspeaker.h"
 
 #include <chrono>
@@ -263,14 +266,22 @@ void Vst3Backend::activateDefaultBuses()
 {
     // VST3 buses are INACTIVE by default. A host that forgets this gets silence out of most
     // plug-ins and no error anywhere to explain it.
-    for (const auto dir : {Vst::kInput, Vst::kOutput}) {
-        const int32 count = mComponent->getBusCount(Vst::kAudio, dir);
-        for (int32 i = 0; i < count; ++i) {
-            Vst::BusInfo info = {};
-            if (mComponent->getBusInfo(Vst::kAudio, dir, i, info) != kResultTrue)
-                continue;
-            if (info.flags & Vst::BusInfo::kDefaultActive)
-                mComponent->activateBus(Vst::kAudio, dir, i, true);
+    //
+    // EVENT buses as well as audio ones, and the pedals beside this host say why in their own
+    // source: without an active event input NO MIDI arrives at all — not the notes that come
+    // through inputEvents, and not the CC and Program Change that come through the parameter
+    // queues either, because a plug-in that sees no event input has no reason to believe the host
+    // will route MIDI to it.
+    for (const auto type : {Vst::kAudio, Vst::kEvent}) {
+        for (const auto dir : {Vst::kInput, Vst::kOutput}) {
+            const int32 count = mComponent->getBusCount(type, dir);
+            for (int32 i = 0; i < count; ++i) {
+                Vst::BusInfo info = {};
+                if (mComponent->getBusInfo(type, dir, i, info) != kResultTrue)
+                    continue;
+                if (info.flags & Vst::BusInfo::kDefaultActive)
+                    mComponent->activateBus(type, dir, i, true);
+            }
         }
     }
 }
@@ -309,6 +320,7 @@ bool Vst3Backend::prepare(const ProcessConfig &config)
     mData.processContext = &mContext;
     mData.inputParameterChanges = &mInputChanges;
     mData.outputParameterChanges = &mOutputChanges;
+    mData.inputEvents = &mEvents;
     mData.processMode = Vst::kRealtime;
     mData.symbolicSampleSize = Vst::kSample32;
 
@@ -369,6 +381,14 @@ bool Vst3Backend::prepare(const ProcessConfig &config)
 
     // Pre-size both rings and both queues so nothing grows on the audio thread. The +8 leaves room
     // for a plug-in that publishes output parameters we did not enumerate.
+    // Where this plug-in wants each kind of MIDI message. Owning thread, before any block runs,
+    // because both lookups call the controller.
+    mMidiRoute.resolve(mController);
+
+    // One cycle's worth of notes. kMaxChunkMidi is the engine's own ceiling on messages per cycle,
+    // so a list that size cannot be overrun by anything the engine is able to hand over.
+    mEvents.setMaxSize(kMaxChunkMidi);
+
     const int32 paramSlots = static_cast<int32>(mParams.size()) + 8;
     mToRt.setMaxParameters(paramSlots);
     mFromRt.setMaxParameters(paramSlots);
@@ -486,7 +506,12 @@ void Vst3Backend::process(const AudioBlock &block) noexcept
 
     mInputChanges.clearQueue();
     mOutputChanges.clearQueue();
+    mEvents.clear();
     mToRt.transferChangesTo(mInputChanges);
+
+    // MIDI goes in after the UI's edits and before process(), so a footswitch and a knob turned in
+    // the same cycle both reach the plug-in in the same block.
+    deliverMidi(block);
 
     // The chain never hands a bus that is known to be silent, and a stale flag from the previous
     // block would tell the plug-in its input is silence when it is not.
@@ -562,6 +587,201 @@ double Vst3Backend::paramGet(uint32_t index) const
     if (index >= mParams.size() || !mController)
         return 0.0;
     return mController->getParamNormalized(mParams[index].id);
+}
+
+//------------------------------------------------------------------------
+// The program list a unit uses, or kNoProgramListId. Walks getUnitInfo comparing ids rather than
+// indexing, because a unit's index and its id are different numbers.
+static Vst::ProgramListID programListOfUnit(Vst::IUnitInfo &units, Vst::UnitID unitId)
+{
+    const int32 count = units.getUnitCount();
+    for (int32 i = 0; i < count; ++i) {
+        Vst::UnitInfo info = {};
+        if (units.getUnitInfo(i, info) != kResultOk)
+            continue;
+        if (info.id == unitId)
+            return info.programListId;
+    }
+    return Vst::kNoProgramListId;
+}
+
+static int32 programsInList(Vst::IUnitInfo &units, Vst::ProgramListID listId)
+{
+    const int32 count = units.getProgramListCount();
+    for (int32 i = 0; i < count; ++i) {
+        Vst::ProgramListInfo info = {};
+        if (units.getProgramListInfo(i, info) != kResultOk)
+            continue;
+        if (info.id == listId)
+            return info.programCount;
+    }
+    return 0;
+}
+
+// Being handed an id is not an assertion that the parameter exists: IMidiMapping and IUnitInfo both
+// hand back an id, and a host that writes to an id nothing was declared under simply loses the
+// message with no error anywhere. So both routes are checked against the declared parameters before
+// they are believed.
+static bool parameterExists(Vst::IEditController &controller, Vst::ParamID id, int32 requiredFlags)
+{
+    const int32 count = controller.getParameterCount();
+    for (int32 i = 0; i < count; ++i) {
+        Vst::ParameterInfo info = {};
+        if (controller.getParameterInfo(i, info) != kResultOk)
+            continue;
+        if (info.id != id)
+            continue;
+        return requiredFlags == 0 || (info.flags & requiredFlags) == requiredFlags;
+    }
+    return false;
+}
+
+//------------------------------------------------------------------------
+void Vst3Backend::MidiRoute::clear()
+{
+    for (int ch = 0; ch < kChannels; ++ch) {
+        for (int cc = 0; cc < kControllers; ++cc)
+            mCc[ch][cc] = Vst::kNoParamId;
+        mProgram[ch] = Program{};
+    }
+    mHasCc = false;
+    mHasProgram = false;
+}
+
+//------------------------------------------------------------------------
+double Vst3Backend::MidiRoute::programValue(int channel, int program) const
+{
+    if (channel < 0 || channel >= kChannels)
+        return 0.0;
+    const int32 count = mProgram[channel].count;
+    if (count < 2)
+        return 0.0;
+    if (program < 0)
+        program = 0;
+    if (program > count - 1)
+        program = count - 1;
+    return static_cast<double>(program) / static_cast<double>(count - 1);
+}
+
+//------------------------------------------------------------------------
+void Vst3Backend::MidiRoute::resolve(Vst::IEditController *controller)
+{
+    clear();
+    if (!controller)
+        return;
+
+    // --- Control Change --------------------------------------------------
+    if (FUnknownPtr<Vst::IMidiMapping> mapping = FUnknownPtr<Vst::IMidiMapping>(controller)) {
+        for (int ch = 0; ch < kChannels; ++ch) {
+            for (int cc = 0; cc < kControllers; ++cc) {
+                Vst::ParamID id = Vst::kNoParamId;
+                if (mapping->getMidiControllerAssignment(0, static_cast<int16>(ch),
+                                                         static_cast<Vst::CtrlNumber>(cc),
+                                                         id) != kResultTrue)
+                    continue;
+                if (id == Vst::kNoParamId || !parameterExists(*controller, id, 0))
+                    continue;
+                mCc[ch][cc] = id;
+                mHasCc = true;
+            }
+        }
+    }
+
+    // --- Program Change --------------------------------------------------
+    if (FUnknownPtr<Vst::IUnitInfo> units = FUnknownPtr<Vst::IUnitInfo>(controller)) {
+        for (int ch = 0; ch < kChannels; ++ch) {
+            Vst::UnitID unitId = Vst::kRootUnitId;
+            if (units->getUnitByBus(Vst::kEvent, Vst::kInput, 0, static_cast<int16>(ch), unitId) !=
+                kResultTrue)
+                continue;
+
+            const Vst::ProgramListID listId = programListOfUnit(*units, unitId);
+            if (listId == Vst::kNoProgramListId)
+                continue;
+
+            // EditControllerEx1 builds a program list's parameter with the LIST's own id as the
+            // ParamID, so the two numbers are the same number by construction rather than by
+            // coincidence.
+            const Vst::ParamID id = static_cast<Vst::ParamID>(listId);
+            if (!parameterExists(*controller, id, Vst::ParameterInfo::kIsProgramChange))
+                continue;
+
+            const int32 count = programsInList(*units, listId);
+            if (count < 2)
+                continue;
+
+            mProgram[ch].id = id;
+            mProgram[ch].count = count;
+            mHasProgram = true;
+        }
+    }
+}
+
+//------------------------------------------------------------------------
+// Audio thread. Open whichever of the three doors each message belongs to. No allocation, no lock,
+// no controller call: every lookup here is an array subscript into the table prepare() built.
+void Vst3Backend::deliverMidi(const AudioBlock &block) noexcept
+{
+    for (int32_t i = 0; i < block.midiCount; ++i) {
+        const RtMidiEvent &m = block.midi[i];
+        const int status = m.status & 0xf0;
+        const int channel = m.status & 0x0f;
+        const int data1 = m.data1 & 0x7f;
+        const int data2 = m.data2 & 0x7f;
+        const int32 offset = m.frame;
+
+        switch (status) {
+            case 0xb0: { // Control Change
+                const Vst::ParamID id = mMidiRoute.ccParam(channel, data1);
+                if (id == Vst::kNoParamId)
+                    break;
+                int32 index = 0;
+                if (Vst::IParamValueQueue *queue = mInputChanges.addParameterData(id, index)) {
+                    int32 point = 0;
+                    queue->addPoint(offset, data2 / 127.0, point);
+                }
+                break;
+            }
+            case 0xc0: { // Program Change
+                const Vst::ParamID id = mMidiRoute.programParam(channel);
+                if (id == Vst::kNoParamId)
+                    break;
+                int32 index = 0;
+                if (Vst::IParamValueQueue *queue = mInputChanges.addParameterData(id, index)) {
+                    int32 point = 0;
+                    queue->addPoint(offset, mMidiRoute.programValue(channel, data1), point);
+                }
+                break;
+            }
+            case 0x90:   // Note On
+            case 0x80: { // Note Off
+                // A note on at velocity 0 is a note OFF — the oldest convention in MIDI, and one a
+                // controller is entitled to use. Delivering it as an on would latch a footswitch
+                // again when the foot came up.
+                const bool on = (status == 0x90) && data2 > 0;
+                Vst::Event e = {};
+                e.busIndex = 0;
+                e.sampleOffset = offset;
+                e.type = on ? static_cast<uint16>(Vst::Event::kNoteOnEvent)
+                            : static_cast<uint16>(Vst::Event::kNoteOffEvent);
+                if (on) {
+                    e.noteOn.channel = static_cast<int16>(channel);
+                    e.noteOn.pitch = static_cast<int16>(data1);
+                    e.noteOn.velocity = static_cast<float>(data2) / 127.0f;
+                    e.noteOn.noteId = -1;
+                } else {
+                    e.noteOff.channel = static_cast<int16>(channel);
+                    e.noteOff.pitch = static_cast<int16>(data1);
+                    e.noteOff.velocity = static_cast<float>(data2) / 127.0f;
+                    e.noteOff.noteId = -1;
+                }
+                mEvents.addEvent(e); // full is a drop, not a growth
+                break;
+            }
+            default:
+                break;
+        }
+    }
 }
 
 //------------------------------------------------------------------------
@@ -717,6 +937,20 @@ bool Vst3Backend::paramPollFromRt(uint32_t &index, double &normalized)
     if (!mFromRt.getNextChange(id, value, offset))
         return false;
 
+    // THE CONTROLLER IS UPDATED HERE, AND THAT IS THE WHOLE POINT OF DRAINING.
+    //
+    // A plug-in that changes a parameter BY ITSELF — a footswitch stomped by MIDI, a tempo-synced
+    // knob following the transport — reports it by writing a point into the block's output
+    // parameter changes. That is a statement from the PROCESSOR, and the processor has no way to
+    // reach its own controller: the two halves of a VST3 plug-in are separate objects and it is the
+    // host that carries values between them.
+    //
+    // So without this line the plug-in's own editor never learns, and neither does anything else,
+    // because paramGet() reads the controller too. The sound changes and every display of it stays
+    // where it was — which is exactly how a footswitch behaves with the lamp painted on.
+    if (mController)
+        mController->setParamNormalized(id, value);
+
     for (size_t i = 0; i < mParams.size(); ++i) {
         if (mParams[i].id == id) {
             index = static_cast<uint32_t>(i);
@@ -864,6 +1098,29 @@ bool Vst3Backend::editorOpen(const EditorOpenRequest &request, EditorSurface &ou
     out.height = rect.getHeight();
     out.resizable = mView->canResize() == kResultTrue;
     return true;
+}
+
+//------------------------------------------------------------------------
+// Run loop, once per UI tick while this plug-in's own editor is open.
+void Vst3Backend::editorIdle()
+{
+    // Bounded, so a plug-in publishing a meter on every block cannot own the timer. Anything left
+    // is taken on the next tick; the values are absolute rather than incremental, so arriving a
+    // frame late costs nothing and arriving out of order is not possible.
+    //
+    // The generic panel runs the identical loop for the nodes it is showing instead, and the two
+    // never overlap: a node has one window or the other, never both.
+    //
+    // A node with NO window open drains nowhere, and that is deliberate rather than overlooked. The
+    // ring drops rather than growing, the processor's own state — which is what a preset saves — is
+    // unaffected, and the only thing that can go stale is a display that is not on screen. It
+    // catches up on the first tick after a window opens.
+    for (int guard = 0; guard < 32; ++guard) {
+        uint32_t index = 0;
+        double normalized = 0.0;
+        if (!paramPollFromRt(index, normalized))
+            break;
+    }
 }
 
 //------------------------------------------------------------------------

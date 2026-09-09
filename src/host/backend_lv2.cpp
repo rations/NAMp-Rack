@@ -11,6 +11,7 @@
 #include <lv2/atom/util.h>
 #include <lv2/buf-size/buf-size.h>
 #include <lv2/core/lv2.h>
+#include <lv2/midi/midi.h>
 #include <lv2/parameters/parameters.h>
 #include <lv2/presets/presets.h>
 #include <lv2/resize-port/resize-port.h>
@@ -320,9 +321,15 @@ bool Lv2Backend::readPorts(std::string &error)
             // The flag exists so the UI transfer path can skip it, not so the buffer can be
             // skipped.
             if (LilvNodes *supports = lilv_port_get_value(mPlugin, port, n.atomSupports)) {
-                out.carriesMidiOnly = lilv_nodes_size(supports) > 0 &&
-                                      lv2NodesContain(supports, n.midiEvent) &&
-                                      lilv_nodes_size(supports) == 1;
+                const bool midi = lv2NodesContain(supports, n.midiEvent);
+                out.carriesMidiOnly =
+                    lilv_nodes_size(supports) > 0 && midi && lilv_nodes_size(supports) == 1;
+                // SEPARATE FROM carriesMidiOnly, and it has to be. That flag asks "is this port
+                // ONLY MIDI", which is a question about whether the UI transfer path can skip it.
+                // This one asks "will this port take MIDI", and the common shape in the wild is a
+                // port that supports MIDI *and* patch messages *and* time position — one that
+                // carriesMidiOnly is false for and that a footswitch must still reach.
+                out.acceptsMidi = midi;
                 lilv_nodes_free(supports);
             }
             continue;
@@ -401,6 +408,7 @@ void Lv2Backend::buildFeatures()
     mUridAtomChunk = urids.map(LV2_ATOM__Chunk);
     mUridAtomSequence = urids.map(LV2_ATOM__Sequence);
     mUridAtomEventTransfer = urids.map(LV2_ATOM__eventTransfer);
+    mUridMidiEvent = urids.map(LV2_MIDI__MidiEvent);
     mUridFloat = urids.map(LV2_ATOM__Float);
 
     mOptMinBlock = mConfig.maxBlock;
@@ -720,6 +728,39 @@ void Lv2Backend::process(const AudioBlock &block) noexcept
                             reinterpret_cast<const uint8_t *>(atom) + sizeof(LV2_Atom));
         }
         mUiToRtPending.store(false, std::memory_order_release);
+    }
+
+    // 3b. Deliver this block's MIDI. LV2 has no separate event queue and no parameter door for a
+    //     controller: a MIDI message is three bytes written into an atom sequence as an event of
+    //     type midi:MidiEvent, timed in frames, which is the whole protocol. Every input port that
+    //     accepts MIDI gets every message, and every voice does — a dual-mono pair is two instances
+    //     of one pedal and a footswitch means both of them.
+    //
+    //     lv2_evbuf_write appends and reports failure when the buffer is full; a full buffer drops
+    //     the message rather than growing, which is the same bargain the VST3 event list makes.
+    if (block.midiCount > 0 && !mPorts.empty()) {
+        for (Voice &voice : mVoices) {
+            for (const Port &port : mPorts) {
+                if (port.kind != Port::Kind::Atom || !port.isInput || !port.acceptsMidi)
+                    continue;
+                LV2_Evbuf *buf = voice.atoms[port.index];
+                if (!buf)
+                    continue;
+                LV2_Evbuf_Iterator iter = lv2_evbuf_end(buf);
+                for (int32_t i = 0; i < block.midiCount; ++i) {
+                    const RtMidiEvent &m = block.midi[i];
+                    // Running status never reaches here — JACK delivers whole messages — so the
+                    // length is decided by the status byte alone. Program Change and Channel
+                    // Pressure are two bytes; everything else this host forwards is three.
+                    const uint8_t high = m.status & 0xf0;
+                    const uint32_t size = (high == 0xc0 || high == 0xd0) ? 2u : 3u;
+                    const uint8_t bytes[3] = {m.status, m.data1, m.data2};
+                    if (!lv2_evbuf_write(&iter, static_cast<uint32_t>(m.frame), 0, mUridMidiEvent,
+                                         size, bytes))
+                        break; // full: the rest of this block's messages are dropped
+                }
+            }
+        }
     }
 
     // 4. Point the audio ports at this block and run.

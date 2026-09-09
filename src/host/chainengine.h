@@ -52,6 +52,8 @@
 #pragma once
 
 #include "chainmodel.h"
+// AudioBlock and RtMidiEvent: what a node is handed, and what rides beside the audio.
+#include "pluginref.h"
 #include "spscqueue.h"
 
 #include <atomic>
@@ -116,7 +118,12 @@ public:
 
     //--- audio thread ----------------------------------------------------
     // Adopt a newly published chain and hand back the old one. Once per JACK cycle.
-    void beginBlock() noexcept;
+    //
+    // `midi` is the whole cycle's messages, ordered by frame, valid until the next beginBlock().
+    // The engine copies nothing: it hands each chunk the sub-range that falls inside it, with the
+    // frame offsets rebased, so a node never has to know it was handed a chunk rather than a block.
+    // Pass nothing for a cycle with no MIDI, which is nearly all of them.
+    void beginBlock(const RtMidiEvent *midi = nullptr, int32_t midiCount = 0) noexcept;
     // Run the pre-section and report where the anchor should read and write. `in` is JACK's input
     // buffer and is never written.
     void beginChunk(const float *in, float *outL, float *outR, int32_t frames,
@@ -139,8 +146,26 @@ private:
 
     // Audio-thread state.
     RtChain *mLive = nullptr;
+    // Audio thread. Narrow this cycle's MIDI to the chunk about to run and rebase its offsets.
+    void sliceMidi(int32_t frames) noexcept;
+
     RtChain *mHoldover = nullptr; // retired but the queue was full; retried next block
     int32_t mFrames = 0;
+
+    // This cycle's MIDI, and where in it the current chunk starts. Borrowed, never owned and never
+    // copied — the caller's array outlives the block. mBlockPos advances in endChunk(), so the pre
+    // and post sections of one chunk are handed the identical slice, which is what makes a message
+    // land on the same sample either side of the amp.
+    const RtMidiEvent *mMidi = nullptr;
+    int32_t mMidiCount = 0;
+    int32_t mBlockPos = 0;
+    // The slice for the chunk being run, rebased to it. Recomputed once per beginChunk().
+    const RtMidiEvent *mChunkMidi = nullptr;
+    int32_t mChunkMidiCount = 0;
+    // The rebased copy handed to nodes. Fixed capacity, sized in prepare(); a cycle carrying more
+    // than this drops the overflow rather than growing, because growing is a malloc on the audio
+    // thread. kMaxChunkMidi is far above what a footswitch or a controller sweep produces.
+    std::vector<RtMidiEvent> mChunkMidiBuf;
 
     std::atomic<RtChain *> mPending{nullptr};
     std::atomic<uint32_t> mLatency{0};
