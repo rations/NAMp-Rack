@@ -721,8 +721,15 @@ public:
         // Re-pushed every tick rather than once at startup: the buffer size can change under a
         // running client, and a cost bar drawn as a fraction of a stale period is a wrong number
         // drawn confidently.
-        if (mAudio.isOpen())
+        if (mAudio.isOpen()) {
             mRack.setAudioPeriod(mAudio.sampleRate(), mAudio.blockSize());
+            // Every tick for the same reason, and because the dropout count is a running total: a
+            // figure pushed once at startup would read zero for the rest of the session no matter
+            // what the device did. The rack repaints only when the text changes.
+            mRack.setAudioStatus(mAudio.deviceSummary(), mAudio.dropouts());
+        } else {
+            mRack.setAudioStatus(std::string(), 0);
+        }
         mRack.onTimer();
     }
 

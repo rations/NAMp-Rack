@@ -79,6 +79,21 @@ constexpr float kTitleSize = 13.0f;
 constexpr float kLabelSize = 12.0f;
 constexpr float kSmallSize = 10.0f;
 
+// The footer's card-view hint, and the least room the device line is allowed to be left with.
+//
+// HERE RATHER THAN AT THE DRAW SITE so the offline audit measures the string the strip actually
+// paints, which is the same reason the panel's own legends live beside its geometry. The footer is
+// three pieces on one line — the pedal count, this hint, and the audio device between them — and
+// the device line is clipped to whatever the other two leave. Clipping means it can never overlap
+// them; what it cannot do on its own is notice that the gap has shrunk to nothing and the device
+// has silently stopped being reported. That is what the minimum is for, and why the audit measures
+// it at the width the strip is actually drawn at rather than trusting the three to fit.
+constexpr const char *kFooterNodesHint = "drag a card onto a cable to splice it in  ·  right-click "
+                                         "a cable to take the pedal after it out";
+// Enough for a backend's name and its rate — "WASAPI exclusive, 48000 Hz" — so that a clipped line
+// still says which device is sounding, which is the question it exists to answer.
+constexpr float kFooterDeviceMinW = 150.0f;
+
 // The one gap between two adjacent header buttons. Every pair uses it — "+ Before"/"+ After",
 // Scan/Presets, Presets/the toggle, and the toggle's own two segments — so it is a constant rather
 // than a literal repeated at each pair. A pair that touched would read as one control with a seam

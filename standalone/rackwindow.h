@@ -177,6 +177,21 @@ public:
                                        : 0.0);
     }
 
+    // The device the standalone has open, and what it has dropped since it opened. Pushed in for
+    // the same reason the period above is: the rack draws a device, it does not choose one, and it
+    // knows nothing about JACK or ASIO or WASAPI.
+    //
+    // Repainted only when the text actually changes. This is called on every UI tick and the answer
+    // is the same on almost all of them, so setting the dirty flag unconditionally would repaint
+    // the whole strip thirty times a second for nothing.
+    void setAudioStatus(std::string status, uint32_t dropouts)
+    {
+        bool changed = mModel.setAudioStatus(std::move(status));
+        changed = mModel.setAudioDropouts(dropouts) || changed;
+        if (changed)
+            mDirty = true;
+    }
+
     // The standalone tells the rack which hosted editors are on screen so the gear can light.
     void setEditorOpen(uint64_t nodeId, bool open);
     // The node id at a section/index, for turning an editor request back into something stable.

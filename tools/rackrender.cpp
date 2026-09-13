@@ -525,6 +525,32 @@ void auditLayout(RackView &view, RackModel &model, const FontStack &fonts)
     check(rackgeo::kShelfY + rackgeo::kCardH * 0.62f < rackgeo::kRackH - 14.0f,
           "the node shelf clears the footer");
 
+    // THE FOOTER IS THREE PIECES ON ONE LINE and the device is the one in the middle, clipped to
+    // whatever the other two leave it. Clipping is what makes an overlap impossible; it is also
+    // what would hide the gap closing entirely, so the room left over is measured here at the size
+    // the strip is really drawn — against the CARD view's hint, which is the longer of the two
+    // cases.
+    //
+    // The left-hand figure is a worst case rather than the one on screen now: the pedal count and
+    // the rack latency both grow, and a footer that fitted an empty rack and not a full one would
+    // only fail once somebody had built a real chain.
+    {
+        cairo_surface_t *probe = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 8, 8);
+        cairo_t *cr = cairo_create(probe);
+        Canvas measure(cr, &fonts, rackgeo::kRackW, rackgeo::kRackH);
+        measure.setFontSize(rackgeo::kSmallSize);
+
+        const float leftW = measure.stringWidth("64 pedals  ·  rack latency 262144 samples");
+        const float hintW = measure.stringWidth(rackgeo::kFooterNodesHint);
+        const float gap = (rackgeo::kRackW - rackgeo::kMargin - hintW) - rackgeo::kMargin -
+                          (rackgeo::kMargin + leftW);
+        check(gap >= rackgeo::kFooterDeviceMinW,
+              "the audio device still has room between the pedal count and the card-view hint");
+
+        cairo_destroy(cr);
+        cairo_surface_destroy(probe);
+    }
+
     // Every control of the first row answers, and each answers differently — a row whose cells
     // overlap would still hit-test, just always to the same thing.
     const float rowY = rackgeo::kListY + rackgeo::kRowH * 0.5f;
