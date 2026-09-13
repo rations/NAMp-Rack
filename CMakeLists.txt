@@ -1148,6 +1148,9 @@ set(NAMPRACK_STANDALONE_SOURCES
     ${NAMPRACK_ROOT}/src/host/hostiids.cpp
     ${NAMPRACK_ROOT}/standalone/audiobackend.h
     ${NAMPRACK_ROOT}/standalone/nativeaudio.h
+    # Which device the user chose, and the file it survives a restart in.
+    ${NAMPRACK_ROOT}/standalone/audioprefs.h
+    ${NAMPRACK_ROOT}/standalone/audioprefs.cpp
     # The run loop and the windows, each a seam over a platform pair. Only one half of each pair is
     # compiled; both halves are built by this machine's own two configures, which is what keeps the
     # platform nobody is looking at today from rotting.

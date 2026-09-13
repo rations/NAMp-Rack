@@ -77,10 +77,33 @@ public:
     {
         mAsio.configure(settings);
     }
+    const AsioSettings &settings() const
+    {
+        return mAsio.settings();
+    }
 #endif
     void configureWasapi(const WasapiSettings &settings)
     {
         mWasapi.configure(settings);
+    }
+    const WasapiSettings &wasapiSettings() const
+    {
+        return mWasapi.settings();
+    }
+
+    // Which of the two is driving the device, for a picker that has to mark the row that is open.
+    // Both are false when nothing is open, which is an ordinary state.
+    bool usingWasapi() const
+    {
+        return mActive == &mWasapi;
+    }
+    bool usingAsio() const
+    {
+#if NAMPRACK_HAVE_ASIO
+        return mActive == &mAsio;
+#else
+        return false;
+#endif
     }
 
     // The top-level window, which ASIO takes as its sysRef — drivers use it as the parent for their

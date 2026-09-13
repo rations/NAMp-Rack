@@ -403,6 +403,16 @@ bool RackWindow::applyAction(const NAMp::rack::RackAction &action)
             mDirty = true;
             return false;
         }
+
+        case Kind::SelectAudioDevice: {
+            // The standalone closes and reopens the device, and pushes the list back in with the
+            // current row moved — so the overlay the user is still looking at shows what actually
+            // happened, which may not be what was asked for.
+            if (mSelectAudioDevice)
+                mSelectAudioDevice(action.text, action.index);
+            mDirty = true;
+            return false;
+        }
     }
 
     mBuilder.publish();

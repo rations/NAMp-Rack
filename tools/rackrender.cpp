@@ -379,6 +379,9 @@ bool applyAction(host::ChainBuilder &builder, RackModel &model, const RackAction
         case RackAction::Kind::ScanPlugins:
         case RackAction::Kind::AddSearchPath:
         case RackAction::Kind::RemoveSearchPath:
+        // The device, for the same reason: the standalone closes and reopens the audio device here,
+        // and there is none offline. The chain is untouched either way.
+        case RackAction::Kind::SelectAudioDevice:
             return false; // the standalone touches the filesystem here; nothing to do offline
         case RackAction::Kind::SetMix:
             builder.setMix(action.section, action.index, action.value);
@@ -1035,6 +1038,65 @@ void auditInteraction(host::ChainBuilder &builder, RackView &view, RackModel &mo
         model.setSearchPaths(nullptr);
     }
 
+    //--- the audio device ---------------------------------------------------
+    {
+        static const std::vector<AudioDeviceRow> devices = {
+            {"ASIO", "Focusrite USB ASIO", "Focusrite USB ASIO", "", true, true},
+            {"ASIO", "Generic Low Latency ASIO Driver", "Generic Low Latency ASIO Driver", "",
+             false, true},
+            {"Input", "{0.0.1.0}", "Analogue 1 + 2", "system default", false, true},
+            {"ASIO", "", "no ASIO driver is installed", "", false, false},
+        };
+        model.setAudioDevices(&devices);
+
+        check(rackgeo::kAudioX + rackgeo::kAudioW < rackgeo::kScanX,
+              "the Audio pill clears the Scan pill");
+        check(rackgeo::kAddAfterX + rackgeo::kAddW < rackgeo::kAudioX,
+              "...and does not collide with + After");
+        check(std::fabs((rackgeo::kScanX - (rackgeo::kAudioX + rackgeo::kAudioW)) -
+                        rackgeo::kBtnGap) < 0.01f,
+              "Audio / Scan are one button gap apart");
+
+        RackAction act =
+            click(view, rackgeo::kAudioX + 10.0f, rackgeo::kAudioY + rackgeo::kToggleH * 0.5f);
+        check(model.picker().open && model.picker().mode == PickerState::Mode::Devices,
+              "the Audio pill opens the overlay in device mode");
+
+        const auto deviceRowY = [](int row) {
+            return rackgeo::kPickerY + rackgeo::kPickerHeaderH +
+                   (static_cast<float>(row) + 0.5f) * rackgeo::kPickerRowH;
+        };
+
+        // A driver that is not the one open is a choice, and it is reported BY ID rather than by
+        // row alone — the standalone matches on the id and uses the row only to know which list it
+        // came from, since an ASIO name and a WASAPI endpoint id are not interchangeable.
+        act = view.mouseDown(rackgeo::kPickerX + 80.0f, deviceRowY(1), 1);
+        check(act.kind == RackAction::Kind::SelectAudioDevice &&
+                  act.text == "Generic Low Latency ASIO Driver" && act.index == 1,
+              "choosing a driver asks for it by id, and says which row it came from");
+        check(model.picker().open,
+              "and the overlay stays up, because reopening a device can fail and this is where it "
+              "would be said");
+
+        // The one already open is not a click that does anything: reopening it would be a gap in
+        // the audio for no change at all.
+        act = view.mouseDown(rackgeo::kPickerX + 80.0f, deviceRowY(0), 1);
+        check(act.kind == RackAction::Kind::Redraw, "the device already open cannot be re-chosen");
+
+        // Nor is a row that is there to be read rather than chosen.
+        act = view.mouseDown(rackgeo::kPickerX + 80.0f, deviceRowY(3), 1);
+        check(act.kind == RackAction::Kind::Redraw, "a row that is not a device cannot be chosen");
+
+        // An input is a different kind of choice from a driver, and the row index is what carries
+        // that: the id alone would not say whether it names a driver or half of a pair.
+        act = view.mouseDown(rackgeo::kPickerX + 80.0f, deviceRowY(2), 1);
+        check(act.kind == RackAction::Kind::SelectAudioDevice && act.index == 2,
+              "an input endpoint is chosen as its own row");
+
+        model.picker().open = false;
+        model.setAudioDevices(nullptr);
+    }
+
     //--- the picker ---------------------------------------------------------
     action = click(view, rackgeo::kAddBeforeX + 10.0f, rackgeo::kAddY + rackgeo::kAddH * 0.5f);
     check(model.picker().open && model.picker().section == host::ChainSection::Pre,
@@ -1444,6 +1506,30 @@ int main(int argc, char **argv)
     ok = renderTo(prefix + "-paths.png", view, model, fonts, scale) && ok;
     model.picker().open = false;
     model.setSearchPaths(nullptr);
+
+    // The device overlay. The rows are what the standalone would build on a Windows machine with an
+    // interface in it — the shape this list has to read well in is a driver, two inputs and two
+    // outputs, where one of each is the one that is open.
+    static const std::vector<AudioDeviceRow> demoDevices = {
+        {"ASIO", "Focusrite USB ASIO", "Focusrite USB ASIO", "", true, true},
+        {"ASIO", "Generic Low Latency ASIO Driver", "Generic Low Latency ASIO Driver", "", false,
+         true},
+        {"Input", "{0.0.1.0}\\in0", "Analogue 1 + 2 (Focusrite USB)", "system default", false,
+         true},
+        {"Input", "{0.0.1.0}\\in1", "Microphone (Realtek High Definition Audio)", "", false, true},
+        {"Output", "{0.0.0.0}\\out0", "Playback 1 + 2 (Focusrite USB)", "system default", false,
+         true},
+        {"Output", "{0.0.0.0}\\out1", "Speakers (Realtek High Definition Audio)", "", false, true},
+    };
+    model.setAudioDevices(&demoDevices);
+    model.setAudioStatus("ASIO Focusrite USB ASIO, 48000 Hz, 128 frames");
+    model.picker().open = true;
+    model.picker().mode = PickerState::Mode::Devices;
+    model.picker().scroll = 0;
+    ok = renderTo(prefix + "-devices.png", view, model, fonts, scale) && ok;
+    model.picker().open = false;
+    model.setAudioDevices(nullptr);
+    model.setAudioStatus(std::string());
 
     model.setPresets(&demoRacks);
     model.setPresetName("crunch");

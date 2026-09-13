@@ -544,6 +544,10 @@ void RackView::drawHeader(Canvas &c)
              mModel->picker().open && mModel->picker().mode == PickerState::Mode::Paths,
              hover.part == HitTarget::Part::Scan, scanLabel);
 
+    drawPill(c, Rect(kAudioX, kAudioY, kAudioW, kToggleH),
+             mModel->picker().open && mModel->picker().mode == PickerState::Mode::Devices,
+             hover.part == HitTarget::Part::Audio, "Audio");
+
     const bool list = mModel->viewMode() == ViewMode::List;
     drawPill(c, Rect(kToggleX, kToggleY, kToggleSegW, kToggleH), list,
              hover.part == HitTarget::Part::ViewToggleList, "List");
@@ -923,6 +927,7 @@ void RackView::drawPicker(Canvas &c)
 
     const bool presets = picker.mode == PickerState::Mode::Presets;
     const bool paths = picker.mode == PickerState::Mode::Paths;
+    const bool devices = picker.mode == PickerState::Mode::Devices;
 
     c.setFont(Font::Title);
     c.setFontSize(kLabelSize + 1.0f);
@@ -931,6 +936,8 @@ void RackView::drawPicker(Canvas &c)
         c.drawString("Racks", kPickerX + 14.0f, kPickerY + 22.0f);
     else if (paths)
         c.drawString("Plug-ins", kPickerX + 14.0f, kPickerY + 22.0f);
+    else if (devices)
+        c.drawString("Audio", kPickerX + 14.0f, kPickerY + 22.0f);
     else
         c.drawString(picker.section == host::ChainSection::Pre ? "Add a pedal before the amp"
                                                                : "Add a pedal after the amp",
@@ -958,8 +965,30 @@ void RackView::drawPicker(Canvas &c)
     drawCross(c, close,
               mModel->hover().part == HitTarget::Part::PickerClose ? kIconHot : kIconColor);
 
+    if (devices) {
+        // The device that is open, in the header, so the list below reads as a choice against
+        // something rather than as a list of names with no present tense.
+        const std::string &open = mModel->audioStatus();
+        c.setFontSize(kSmallSize);
+        c.setColor(kOffColor);
+        const std::string line = open.empty() ? std::string("no device open") : open;
+        const std::string shown = c.clipToWidth(line, kPickerW * 0.6f);
+        c.drawString(shown.c_str(), kPickerX + kPickerW - 40.0f - c.stringWidth(shown.c_str()),
+                     kPickerY + 22.0f);
+    }
+
+    const std::vector<AudioDeviceRow> *deviceRows = mModel->audioDevices();
+    if (devices && (!deviceRows || deviceRows->empty())) {
+        c.setFontSize(kLabelSize);
+        c.setColor(kOffColor);
+        c.drawString("No audio devices were found. The editor still runs; there is just nothing "
+                     "to play through.",
+                     kPickerX + 14.0f, kPickerY + kPickerHeaderH + 22.0f);
+        return;
+    }
+
     const std::vector<host::PluginDesc> *catalog = mModel->catalog();
-    if (!presets && !paths && (!catalog || catalog->empty())) {
+    if (!presets && !paths && !devices && (!catalog || catalog->empty())) {
         c.setFontSize(kLabelSize);
         c.setColor(kOffColor);
         c.drawString("No plug-ins have been scanned yet. Use Scan to look again, or to add a "
@@ -986,6 +1015,40 @@ void RackView::drawPicker(Canvas &c)
 
         c.setColor(hot ? kRowBgHover : (index % 2 ? kRowBgOdd : kRowBgEven));
         c.fillRect(row);
+
+        if (devices) {
+            if (!deviceRows || static_cast<size_t>(index) >= deviceRows->size())
+                continue;
+            const AudioDeviceRow &dev = (*deviceRows)[static_cast<size_t>(index)];
+
+            // The group on the left, in the same column the search-path list puts its format tag:
+            // the two lists are the same shape and reading them should be the same motion.
+            c.setFontSize(kSmallSize);
+            c.setColor(kOffColor);
+            c.drawString(c.clipToWidth(dev.group, 44.0f).c_str(), row.x + 12.0f,
+                         row.centerY() + 3.5f);
+
+            // The one that is open is in the accent, like the rack that is loaded in the preset
+            // list. A row that cannot be chosen is dim whether or not the pointer is over it.
+            c.setFontSize(kLabelSize - 1.0f);
+            if (dev.current)
+                c.setColor(geo::kAccent);
+            else if (!dev.selectable)
+                c.setColor(kOffColor);
+            else
+                c.setColor(hot ? geo::kTextColor : 0xD8D4D0);
+            c.drawString(c.clipToWidth(dev.name, kPickerW - 230.0f).c_str(), row.x + 62.0f,
+                         row.centerY() + 3.5f);
+
+            if (!dev.detail.empty()) {
+                c.setFontSize(kSmallSize);
+                c.setColor(kOffColor);
+                const std::string detail = c.clipToWidth(dev.detail, 150.0f);
+                c.drawString(detail.c_str(), row.right() - c.stringWidth(detail.c_str()) - 12.0f,
+                             row.centerY() + 3.5f);
+            }
+            continue;
+        }
 
         if (paths) {
             if (index == kPathScanRow) {
@@ -1253,6 +1316,10 @@ int RackView::pickerRowCount() const
         const std::vector<SearchPathRow> *paths = mModel->searchPaths();
         return kPathFirstRow + (paths ? static_cast<int>(paths->size()) : 0);
     }
+    if (mModel->picker().mode == PickerState::Mode::Devices) {
+        const std::vector<AudioDeviceRow> *devices = mModel->audioDevices();
+        return devices ? static_cast<int>(devices->size()) : 0;
+    }
     const std::vector<host::PluginDesc> *catalog = mModel->catalog();
     return catalog ? static_cast<int>(catalog->size()) : 0;
 }
@@ -1340,6 +1407,10 @@ HitTarget RackView::hitTest(float x, float y) const
     }
     if (Rect(kScanX, kScanY, kScanW, kToggleH).contains(x, y)) {
         hit.part = HitTarget::Part::Scan;
+        return hit;
+    }
+    if (Rect(kAudioX, kAudioY, kAudioW, kToggleH).contains(x, y)) {
+        hit.part = HitTarget::Part::Audio;
         return hit;
     }
 
@@ -1735,6 +1806,13 @@ RackAction RackView::mouseUp(float x, float y, int button)
             picker.mode = PickerState::Mode::Paths;
             return RackAction::redraw();
         }
+        case HitTarget::Part::Audio: {
+            PickerState &picker = mModel->picker();
+            picker.open = true;
+            picker.scroll = 0;
+            picker.mode = PickerState::Mode::Devices;
+            return RackAction::redraw();
+        }
         default:
             break;
     }
@@ -1978,6 +2056,30 @@ RackAction RackView::pickerMouseDown(float x, float y, int button)
                 return RackAction::redraw();
             }
             return RackAction::redraw();
+        }
+
+        if (picker.mode == PickerState::Mode::Devices) {
+            const std::vector<AudioDeviceRow> *devices = mModel->audioDevices();
+            const size_t which = static_cast<size_t>(hit.slot);
+            if (!devices || hit.slot < 0 || which >= devices->size())
+                return RackAction::redraw();
+            const AudioDeviceRow &dev = (*devices)[which];
+            // A row that cannot be chosen, or the one already open, is not a click that does
+            // anything. Reopening the device that is already open would be a silent gap in the
+            // audio for no change at all.
+            if (!dev.selectable || dev.current)
+                return RackAction::redraw();
+
+            action.kind = RackAction::Kind::SelectAudioDevice;
+            action.text = dev.id;
+            // WHICH ROW, not only which id. An id on its own could be an ASIO driver or either half
+            // of a WASAPI pair, and the standalone does three different things with those.
+            action.index = hit.slot;
+            // THE OVERLAY STAYS OPEN, unlike every other picker here. Choosing a device closes and
+            // reopens the audio device, which can fail or land somewhere other than asked, and the
+            // list is where that is reported — closing it would hide the answer to the question the
+            // click just asked. It also makes choosing an input and then an output one visit.
+            return action;
         }
 
         if (picker.mode == PickerState::Mode::Presets) {

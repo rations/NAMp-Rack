@@ -109,6 +109,13 @@ constexpr float kPresetsW = 72.0f;
 // how you get at the list of folders being searched.
 constexpr float kScanW = 60.0f;
 
+// Audio, left of Scan. THE DEVICE BELONGS TO THE HOST AND NOT TO THE AMP, which is why the picker
+// is here rather than on the amp's own setup page: the amp is a plug-in that also runs inside a
+// DAW, where it has no device to choose and the question does not arise. The strip is where this
+// program's own settings live — the plug-in search paths and the saved racks are already here for
+// the same reason — so the interface it opens the device with belongs beside them.
+constexpr float kAudioW = 62.0f;
+
 // View toggle, top-right: two pills, "List" and "Nodes". kToggleW is the pair's total extent, so
 // moving the pair does not depend on knowing how it is divided; kToggleSegW is one segment.
 constexpr float kToggleW = 116.0f;
@@ -121,6 +128,8 @@ constexpr float kPresetsX = kToggleX - kBtnGap - kPresetsW;
 constexpr float kPresetsY = kToggleY;
 constexpr float kScanX = kPresetsX - kBtnGap - kScanW;
 constexpr float kScanY = kToggleY;
+constexpr float kAudioX = kScanX - kBtnGap - kAudioW;
+constexpr float kAudioY = kToggleY;
 
 // "+ Before" / "+ After", top-left. Adding is per section because the section fixes a node's
 // channel count for the life of the instance (mono before the amp, stereo after it), so it is not

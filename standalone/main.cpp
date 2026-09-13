@@ -18,6 +18,7 @@
 // and the run loop are all single-threaded here, which is the same contract a DAW provides.
 
 #include "audiobackend.h"
+#include "audioprefs.h"
 #include "nativeaudio.h"
 #include "midiroute.h"
 #include "editorframe.h"
@@ -842,6 +843,193 @@ private:
 };
 
 //------------------------------------------------------------------------
+// The devices the picker lists, and what choosing one means.
+//
+// THE TRANSLATION LIVES HERE for the same reason buildSearchPathRows does, just below: the backend
+// knows devices, the rack knows rows, and neither should have to know the other. A backend that
+// built UI rows would be a backend that included the rack's headers; a rack that read a backend
+// would be a rack that could not be rendered offline with no audio system present.
+//
+// THE TWO PLATFORMS ARE NOT THE SAME QUESTION, which is why this is two functions rather than one
+// with a branch inside it. On Windows there is a real choice to make and it has three parts — an
+// ASIO driver, or a WASAPI input and a WASAPI output, which are picked separately. On Linux there
+// is no choice to make at all: JACK's device was chosen when the server was started, by whoever
+// started it, and offering a list here would be offering to change something this program cannot
+// change.
+
+#if SMTG_OS_WINDOWS
+
+// What was saved, put back into the backend before it is asked anything. Nothing is validated here:
+// a driver that is no longer installed or an endpoint id that names nothing falls back inside the
+// backend, with a word on stderr, because an interface that is merely unplugged today is one the
+// user still wants tomorrow.
+void applyAudioPrefs(Rations::WinAudio &audio, const Rations::AudioPrefs &prefs)
+{
+    if (prefs.backend == "asio")
+        audio.setPreference(Rations::WinAudio::Preference::Asio);
+    else if (prefs.backend == "wasapi")
+        audio.setPreference(Rations::WinAudio::Preference::Wasapi);
+
+#if defined(NAMPRACK_HAVE_ASIO) && NAMPRACK_HAVE_ASIO
+    if (!prefs.asioDriver.empty()) {
+        Rations::AsioSettings settings = audio.settings();
+        settings.driverName = prefs.asioDriver;
+        audio.configureAsio(settings);
+    }
+#endif
+
+    Rations::WasapiSettings wasapi = audio.wasapiSettings();
+    wasapi.captureDeviceId = prefs.captureDevice;
+    wasapi.renderDeviceId = prefs.renderDevice;
+    wasapi.exclusive = prefs.exclusive;
+    audio.configureWasapi(wasapi);
+}
+
+void buildAudioDeviceRows(Rations::WinAudio &audio, std::vector<NAMp::rack::AudioDeviceRow> &rows)
+{
+    rows.clear();
+
+#if defined(NAMPRACK_HAVE_ASIO) && NAMPRACK_HAVE_ASIO
+    // A registry enumeration: no driver is loaded, so an interface that is unplugged still lists
+    // and simply fails to open. Deliberately NOT probed here — probing loads the driver, and some
+    // put up dialogs when they do — so a row carries the name and nothing else until it is chosen.
+    const int drivers = Rations::AsioBackend::driverCount();
+    for (int i = 0; i < drivers; ++i) {
+        std::string name;
+        if (!Rations::AsioBackend::driverName(i, name) || name.empty())
+            continue;
+        NAMp::rack::AudioDeviceRow row;
+        row.group = "ASIO";
+        row.id = name;
+        row.name = name;
+        row.current = audio.preference() != Rations::WinAudio::Preference::Wasapi &&
+                      audio.isOpen() && audio.settings().driverName == name;
+        rows.push_back(std::move(row));
+    }
+    if (drivers == 0) {
+        NAMp::rack::AudioDeviceRow row;
+        row.group = "ASIO";
+        row.name = "no ASIO driver is installed";
+        row.detail = "WASAPI is used instead";
+        row.selectable = false;
+        rows.push_back(std::move(row));
+    }
+#endif
+
+    // Enumeration opens no stream and takes no device, so this is safe while something else is
+    // playing — including while our own device is open, which it is every time the picker is used.
+    const Rations::WasapiSettings &wasapi = audio.wasapiSettings();
+    const bool wasapiLive = audio.isOpen() && audio.usingWasapi();
+    struct {
+        bool capture;
+        const char *group;
+        const std::string &chosen;
+    } directions[] = {{true, "Input", wasapi.captureDeviceId},
+                      {false, "Output", wasapi.renderDeviceId}};
+
+    for (const auto &dir : directions) {
+        std::vector<Rations::WasapiBackend::DeviceEntry> entries;
+        if (!Rations::WasapiBackend::enumerate(dir.capture, entries))
+            continue;
+        for (const Rations::WasapiBackend::DeviceEntry &entry : entries) {
+            NAMp::rack::AudioDeviceRow row;
+            row.group = dir.group;
+            row.id = entry.id;
+            row.name = entry.name;
+            if (entry.isDefault)
+                row.detail = "system default";
+            // An empty saved id means the default endpoint, so that is the row that is current.
+            row.current =
+                wasapiLive && (dir.chosen.empty() ? entry.isDefault : dir.chosen == entry.id);
+            rows.push_back(std::move(row));
+        }
+    }
+}
+
+// True when the device has to be reopened to honour the choice.
+bool applyAudioDeviceChoice(Rations::WinAudio &audio,
+                            const std::vector<NAMp::rack::AudioDeviceRow> &rows, int rowIndex,
+                            const std::string &id, Rations::AudioPrefs &prefs)
+{
+    if (rowIndex < 0 || static_cast<size_t>(rowIndex) >= rows.size())
+        return false;
+    const NAMp::rack::AudioDeviceRow &row = rows[static_cast<size_t>(rowIndex)];
+    if (!row.selectable)
+        return false;
+
+    // WHICH LIST IT CAME FROM IS WHAT DECIDES, not the id: an ASIO driver's id is its name and a
+    // WASAPI endpoint's is a system string, and the same click means three different things
+    // depending on which heading it was under.
+    if (row.group == "ASIO") {
+#if defined(NAMPRACK_HAVE_ASIO) && NAMPRACK_HAVE_ASIO
+        Rations::AsioSettings settings = audio.settings();
+        settings.driverName = id;
+        audio.configureAsio(settings);
+        // Named outright rather than left on Auto: the user picked this driver, so a silent fall
+        // back to WASAPI would give them a different latency and no word about it.
+        audio.setPreference(Rations::WinAudio::Preference::Asio);
+        prefs.backend = "asio";
+        prefs.asioDriver = id;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    Rations::WasapiSettings settings = audio.wasapiSettings();
+    if (row.group == "Input")
+        settings.captureDeviceId = id;
+    else if (row.group == "Output")
+        settings.renderDeviceId = id;
+    else
+        return false;
+    audio.configureWasapi(settings);
+    // Choosing a WASAPI endpoint is choosing WASAPI. Leaving the preference on Auto would open ASIO
+    // instead on any machine that has a driver, and the endpoint just picked would do nothing.
+    audio.setPreference(Rations::WinAudio::Preference::Wasapi);
+    prefs.backend = "wasapi";
+    prefs.captureDevice = settings.captureDeviceId;
+    prefs.renderDevice = settings.renderDeviceId;
+    prefs.exclusive = settings.exclusive;
+    return true;
+}
+
+#else
+
+void applyAudioPrefs(Rations::JackClient &, const Rations::AudioPrefs &)
+{
+    // Nothing to apply: JACK's device was chosen when the server was started. The file is still
+    // read and written, so a rig moved between platforms keeps whatever the other one saved.
+}
+
+void buildAudioDeviceRows(Rations::JackClient &audio, std::vector<NAMp::rack::AudioDeviceRow> &rows)
+{
+    rows.clear();
+    NAMp::rack::AudioDeviceRow row;
+    row.group = "JACK";
+    row.selectable = false;
+    if (audio.isOpen()) {
+        row.name = "the running JACK server";
+        row.detail = "chosen when the server was started";
+        row.current = true;
+    } else {
+        row.name = "no JACK server is running";
+        row.detail = "start one and restart the amp";
+    }
+    rows.push_back(std::move(row));
+}
+
+bool applyAudioDeviceChoice(Rations::JackClient &, const std::vector<NAMp::rack::AudioDeviceRow> &,
+                            int, const std::string &, Rations::AudioPrefs &)
+{
+    // Nothing to choose; see the note above. The single row is not selectable, so this is only ever
+    // reached by a caller that ignored that, and the honest answer is that nothing changed.
+    return false;
+}
+
+#endif
+
+//------------------------------------------------------------------------
 // Where plug-ins are looked for, as the overlay lists it. The automatic rows are the ones discovery
 // reaches on its own — measured by the host layer rather than declared here — and cannot be
 // removed, because removing something nobody added is not a thing this host can do. They are listed
@@ -1171,7 +1359,15 @@ int main(int argc, char **argv)
 
     // Which platform's backend this is, is nativeaudio.h's business and nothing below this line's:
     // everything from here on talks to AudioBackend.
+    // What the user chose last time, read BEFORE the device is probed so the saved interface is the
+    // one asked about rather than one that gets swapped in afterwards. A first run, a missing file
+    // and an unreadable one all leave the defaults, which is "whatever this machine offers".
+    Rations::AudioPrefs audioPrefs;
+    const std::string audioPrefsFile = Rations::AudioPrefs::defaultFile();
+    audioPrefs.load(audioPrefsFile);
+
     Rations::NativeAudio nativeAudio;
+    applyAudioPrefs(nativeAudio, audioPrefs);
     Rations::AudioBackend &audio = nativeAudio;
 
     // What the device is already running at, so setupProcessing can be told the truth before the
@@ -1552,6 +1748,49 @@ int main(int argc, char **argv)
         rack.requestScan();
     };
 
+    // DECLARED HERE, REGISTERED LATER. The picker's handler reopens the device and then has to
+    // reconcile the processor with whatever came back, which is exactly what this already does for
+    // a device that asked to be reopened on its own — so the two share it rather than spelling the
+    // reconfiguration twice. A timer is only registered once there is a device for it to watch.
+    DeviceWatcher deviceWatcher(audio, component, processor, setup, chainEngine, chainBuilder,
+                                "NAMp-Rack", &route);
+
+    // The device list, and what a click on it does.
+    //
+    // THE ROWS ARE REBUILT ON EVERY CHANGE rather than marked in place, because a reopen can land
+    // somewhere other than where it was aimed — an ASIO driver whose hardware is absent falls back
+    // to WASAPI, an endpoint id that no longer names anything falls back to the system default —
+    // and the list the user is still looking at has to show what actually happened rather than what
+    // was asked for. That is also why the overlay stays open across the click.
+    std::vector<NAMp::rack::AudioDeviceRow> audioRows;
+    auto refreshAudioRows = [&]() {
+        buildAudioDeviceRows(nativeAudio, audioRows);
+        rack.setAudioDevices(&audioRows);
+    };
+    refreshAudioRows();
+
+    auto selectAudioDevice = [&](const std::string &id, int row) {
+        if (!applyAudioDeviceChoice(nativeAudio, audioRows, row, id, audioPrefs))
+            return;
+        if (!audioPrefsFile.empty() && !audioPrefs.save(audioPrefsFile))
+            fprintf(stderr, "namp-rack: could not write %s\n", audioPrefsFile.c_str());
+
+        // Closed and reopened rather than reconfigured: neither backend can change device under a
+        // running stream, and both say so — an ASIO driver has to be disposed and started again,
+        // and a WASAPI client is bound to the endpoint it was initialised with.
+        audio.close();
+        if (!audio.open("NAMp-Rack", processor, component, &route)) {
+            fprintf(stderr, "namp-rack: the chosen device would not open; there is no audio\n");
+        } else {
+            // The replacement may be at a different rate or block size, and the processor is still
+            // set up for the one that left. Same path the device-reset watcher uses.
+            deviceWatcher.syncToDevice();
+            audio.notifyLatencyChanged();
+        }
+        refreshAudioRows();
+    };
+    rack.setAudioHandler(selectAudioDevice);
+
     rack.setEditorToggle(toggleEditorFor);
     rack.setEditorClose(closeEditorFor);
     rack.setPresetHandlers(loadRackNamed, saveRackAs, deleteRackNamed);
@@ -1603,8 +1842,6 @@ int main(int argc, char **argv)
         eventLoop.registerTimer(&rackStress, kUiTickMs);
     }
 
-    DeviceWatcher deviceWatcher(audio, component, processor, setup, chainEngine, chainBuilder,
-                                "NAMp-Rack", &route);
     if (audio.isOpen()) {
         // Before the loop starts: the size setupProcessing was told is an estimate on one platform,
         // and this is where the device's real figure replaces it. See syncToDevice.

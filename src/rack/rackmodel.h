@@ -82,6 +82,10 @@ struct RackAction {
         ScanPlugins,      // rescan everything, honouring the cache
         AddSearchPath,    // `text` is an absolute directory
         RemoveSearchPath, // `text` is one of the user's own rows
+        // The audio device. `text` is the row's id and `index` the row it came from, because the
+        // standalone has to know WHICH LIST was clicked — an id alone could be an ASIO driver or
+        // either half of a WASAPI pair, and those are three different things to do with it.
+        SelectAudioDevice,
     };
 
     Kind kind = Kind::NoAction;
@@ -130,6 +134,8 @@ struct HitTarget {
         // because the row and the cross on it do two different things, and a coarse hit target that
         // could not tell them apart would remove a folder the user meant to look at.
         PickerRowRemove,
+        // The header button that opens the device list.
+        Audio,
     };
 
     Part part = Part::NoPart;
@@ -174,6 +180,28 @@ struct SearchPathRow {
 };
 
 //------------------------------------------------------------------------
+// One device the user could open, as the picker lists it.
+//
+// FLAT, AND DELIBERATELY NOT A TREE. The three things being listed are genuinely different — an
+// ASIO driver is one object that owns both directions, while WASAPI has a capture endpoint and a
+// render endpoint that are chosen separately — so a structure that described all of them would have
+// to be the union of the two and would be mostly empty whichever was in use. Instead the standalone
+// flattens whatever its platform has into rows with a `group` heading, and the rack draws rows
+// under headings without knowing what either means.
+//
+// `id` is what gets SAVED and `name` is what gets SHOWN, and they are not the same string: a WASAPI
+// endpoint id is a GUID nobody should ever see, and an ASIO driver's registered name is both. The
+// rack never interprets either.
+struct AudioDeviceRow {
+    std::string group;      // "ASIO", "Input", "Output" — the heading this row sits under
+    std::string id;         // what the standalone saves and matches on
+    std::string name;       // what the user reads
+    std::string detail;     // rates, channels, or why it cannot be opened; may be empty
+    bool current = false;   // the one that is open now
+    bool selectable = true; // false for a row that is there to be read, not chosen
+};
+
+//------------------------------------------------------------------------
 // What a scan is doing, for the progress line. Pushed in by the owner: the rack draws a scan, it
 // does not run one.
 struct ScanState {
@@ -191,7 +219,8 @@ struct PickerState {
     enum class Mode {
         Plugins,
         Presets,
-        Paths, // where plug-ins are looked for, and the button that looks
+        Paths,   // where plug-ins are looked for, and the button that looks
+        Devices, // which audio device the host opens
     };
 
     bool open = false;
@@ -393,6 +422,18 @@ public:
     // Where plug-ins are looked for, and what a running scan is doing. Both pushed in for the same
     // reason the presets are: the rack draws discovery, it does not perform it — which is what lets
     // the offline render drive this whole overlay with no plug-in installed.
+    // The devices the picker lists. Not owned; must outlive this. Null or empty is an ordinary
+    // state — a machine with no device still gets a window — and the picker says so rather than
+    // being unreachable.
+    void setAudioDevices(const std::vector<AudioDeviceRow> *devices)
+    {
+        mAudioDevices = devices;
+    }
+    const std::vector<AudioDeviceRow> *audioDevices() const
+    {
+        return mAudioDevices;
+    }
+
     void setSearchPaths(const std::vector<SearchPathRow> *paths)
     {
         mSearchPaths = paths;
@@ -478,6 +519,7 @@ private:
     bool mDiagArmed = false;
     double mDiagPeriodMicros = 0.0;
 
+    const std::vector<AudioDeviceRow> *mAudioDevices = nullptr;
     std::string mAudioStatus;
     uint32_t mAudioDropouts = 0;
 

@@ -76,6 +76,11 @@ public:
     // window from its progress callback and nothing else may reach the run loop meanwhile.
     using ScanPlugins = std::function<void()>;
     using EditSearchPath = std::function<void(const std::string &dir)>;
+    // The user picked an audio device. `id` is the row's own id and `row` is which row it was,
+    // since an id alone cannot say whether it names an ASIO driver or one half of a WASAPI pair.
+    // The rack knows nothing about either: it lists what it was given and reports which line was
+    // clicked.
+    using SelectAudioDevice = std::function<void(const std::string &id, int row)>;
 
     RackWindow(EventLoop &loop, NAMp::host::ChainBuilder &builder);
     ~RackWindow();
@@ -120,6 +125,17 @@ public:
     {
         mModel.setSearchPaths(paths);
         mDirty = true;
+    }
+    // The devices the picker offers, and what to do when one is chosen. Not owned; must outlive
+    // this. Re-pushed after a change so the `current` row follows the device that actually opened.
+    void setAudioDevices(const std::vector<NAMp::rack::AudioDeviceRow> *devices)
+    {
+        mModel.setAudioDevices(devices);
+        mDirty = true;
+    }
+    void setAudioHandler(SelectAudioDevice select)
+    {
+        mSelectAudioDevice = std::move(select);
     }
     // Ask for a scan on the NEXT timer tick rather than now. A scan is synchronous and paints its
     // own progress, and the click that asked for it arrived in an X event handler — where nothing
@@ -249,6 +265,7 @@ private:
     ScanPlugins mScanPlugins;
     EditSearchPath mAddSearchPath;
     EditSearchPath mRemoveSearchPath;
+    SelectAudioDevice mSelectAudioDevice;
     std::string mPresetName;
 
     NativeWindow mWindow;
