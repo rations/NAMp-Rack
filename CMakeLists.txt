@@ -64,6 +64,21 @@ option(NAMPRACK_BUILD_VST3_BUNDLE "Build the amp as a VST3 bundle for validator 
 # WASAPI-only standalone that needs no agreement with anyone; leaving it ON needs the countersigned
 # agreement before a binary is published, and nothing before a binary is built.
 if(WIN32)
+    # WAS ASIO ASKED FOR, OR IS IT MERELY THE DEFAULT? The two deserve different answers when the
+    # SDK turns out to be missing, and this is the only moment they can still be told apart: a -D on
+    # the command line has already defined the variable by the time control reaches here, and the
+    # default has not. Recorded once and then left alone, because on a reconfigure of an existing
+    # build directory the cache holds a value either way, and reading that as "explicit" would make
+    # every second configure lie about what the first one was asked to do.
+    if(NOT DEFINED NAMPRACK_WIN_ASIO_EXPLICIT)
+        if(DEFINED NAMPRACK_WIN_ASIO)
+            set(NAMPRACK_WIN_ASIO_EXPLICIT ON CACHE INTERNAL
+                "NAMPRACK_WIN_ASIO was set on the command line, not defaulted")
+        else()
+            set(NAMPRACK_WIN_ASIO_EXPLICIT OFF CACHE INTERNAL
+                "NAMPRACK_WIN_ASIO is on by default, not by request")
+        endif()
+    endif()
     option(NAMPRACK_WIN_ASIO "Host ASIO drivers in the Windows standalone (Steinberg ASIO SDK)" ON)
 else()
     # Declared on every platform so a script may set it without a platform test, and forced off
@@ -252,9 +267,24 @@ endif()
 # here is an include root and four translation units. NAMPRACK_ASIO_SDK_DIR can point at another
 # prefix's copy; the default is the one scripts/build-win-deps.sh installs.
 #
-# A MISSING SDK IS A LOUD CONFIGURE ERROR, never a silent WASAPI-only build. Falling back quietly
-# would produce a standalone that looks finished, runs, and cannot reach the audio interface most of
-# its users own — which is the failure this whole decision exists to prevent.
+# A MISSING SDK IS NEVER A SILENT WASAPI-ONLY BUILD, because falling back quietly would produce a
+# standalone that looks finished, runs, and cannot reach the audio interface most of its users own —
+# which is the failure this whole decision exists to prevent. What it is depends on who asked:
+#
+#   * ASKED FOR (-DNAMPRACK_WIN_ASIO=ON) — a configure error. The answer to "build the ASIO backend"
+#     is never "here is a different product".
+#   * DEFAULTED (nobody said anything) — a loud warning and a demotion to WASAPI-only for this
+#     configure. The person has a checkout, no SDK, and no opinion yet; refusing to configure at all
+#     tells them to go and accept a third party's download terms before they can compile a line of
+#     an MIT project. They are not publishing anything, and the licence is a condition on publishing
+#     rather than on building.
+#
+# The demotion sets a normal variable that shadows the cache entry for the rest of this configure
+# and deliberately does NOT rewrite the cache. Writing OFF into the cache would make the fallback
+# sticky, so that a later run of the dependency script would install the SDK and this build would go
+# on quietly ignoring it — which is the silent WASAPI-only build the paragraph above rules out,
+# arriving by a slower route. Left alone, the next configure re-tests and picks ASIO back up by
+# itself the moment the SDK is there.
 # ---------------------------------------------------------------------------
 if(NAMPRACK_WIN_ASIO)
     set(NAMPRACK_ASIO_SDK_DIR "${NAMPRACK_WIN_SYSROOT}/include/asiosdk"
@@ -263,6 +293,7 @@ if(NAMPRACK_WIN_ASIO)
         ${NAMPRACK_ASIO_SDK_DIR}/common/asio.cpp
         ${NAMPRACK_ASIO_SDK_DIR}/host/asiodrivers.cpp
         ${NAMPRACK_ASIO_SDK_DIR}/host/pc/asiolist.cpp)
+    set(_asio_missing "")
     foreach(_asio_file
             ${NAMPRACK_ASIO_SDK_DIR}/common/asio.h
             ${NAMPRACK_ASIO_SDK_DIR}/common/asiosys.h
@@ -272,18 +303,41 @@ if(NAMPRACK_WIN_ASIO)
             ${NAMPRACK_ASIO_SDK_DIR}/host/pc/asiolist.h
             ${NAMPRACK_ASIO_SOURCES})
         if(NOT EXISTS "${_asio_file}")
+            list(APPEND _asio_missing "${_asio_file}")
+        endif()
+    endforeach()
+    if(_asio_missing)
+        # Name one file rather than all nine. The list is the same nine every time the SDK is simply
+        # absent, and a wall of paths buries the sentence that says what to do about it.
+        list(GET _asio_missing 0 _asio_first_missing)
+        set(_asio_where
+            "  Run scripts/build-win-deps.sh, which fetches it into that prefix and verifies what "
+            "arrived. It is never committed to this repository — Steinberg's licence forbids "
+            "redistributing the SDK — so the sysroot is the only place it can come from.")
+        if(NAMPRACK_WIN_ASIO_EXPLICIT)
             message(FATAL_ERROR
                 "NAMPRACK_WIN_ASIO is ON but the ASIO SDK is not in the dependency sysroot: "
-                "${_asio_file} is missing.\n"
-                "  Run scripts/build-win-deps.sh, which fetches it into that prefix and verifies "
-                "what arrived. It is never committed to this repository — Steinberg's licence "
-                "forbids redistributing the SDK — so the sysroot is the only place it can come "
-                "from.\n"
+                "${_asio_first_missing} is missing.\n"
+                ${_asio_where} "\n"
                 "  To build the Windows standalone WITHOUT ASIO support, which is a WASAPI-only "
                 "product and needs no agreement with anyone, configure with "
                 "-DNAMPRACK_WIN_ASIO=OFF.")
         endif()
-    endforeach()
+        message(WARNING
+            "The ASIO SDK is not in the dependency sysroot (${_asio_first_missing} is missing), so "
+            "this configure builds a WASAPI-ONLY standalone.\n"
+            "  THIS IS NOT THE SHIPPED PRODUCT. ASIO is what Windows guitar players run and what "
+            "the latency depends on; WASAPI is the runtime fallback for a machine with no vendor "
+            "driver. A release binary is built with ASIO.\n"
+            ${_asio_where} "\n"
+            "  Nothing here needs an agreement with anyone: the licence is a condition on "
+            "publishing a binary, never on building one. Pass -DNAMPRACK_WIN_ASIO=ON to make a "
+            "missing SDK a hard error instead of this warning, or -DNAMPRACK_WIN_ASIO=OFF to ask "
+            "for the WASAPI-only build deliberately and silence it.")
+        # Shadows the cache entry for this configure only — see the header comment above.
+        set(NAMPRACK_WIN_ASIO OFF)
+        set(NAMPRACK_ASIO_DEMOTED ON)
+    endif()
 endif()
 
 # The SDK's bundle loader, which is per-platform. Named once here rather than at each consumer:
@@ -1257,6 +1311,12 @@ endif()
 if(WIN32)
     if(NAMPRACK_WIN_ASIO)
         message(STATUS "[NAMp-Rack]   audio           ASIO + WASAPI fallback, WinMM MIDI")
+    elseif(NAMPRACK_ASIO_DEMOTED)
+        # Distinguished from the line below on purpose: one of these was asked for and the other is
+        # a checkout with no SDK in it. Reporting both as "NAMPRACK_WIN_ASIO=OFF" would send anyone
+        # reading the log looking for a switch nobody set.
+        message(STATUS "[NAMp-Rack]   audio           WASAPI only (no ASIO SDK in the sysroot), "
+                       "WinMM MIDI")
     else()
         message(STATUS "[NAMp-Rack]   audio           WASAPI only (NAMPRACK_WIN_ASIO=OFF), "
                        "WinMM MIDI")

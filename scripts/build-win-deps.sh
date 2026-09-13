@@ -319,8 +319,24 @@ fi
 # definitions only. The sample DRIVER, the COM registration code, the debug
 # helpers and the MSVC project files are all for writing a driver rather than
 # hosting one, and none of them is on this product's include path.
+#
+# NAMPRACK_SKIP_ASIO=1 SKIPS THIS STEP, and the rest of the sysroot still builds.
+# The download is licence-gated on Steinberg's page, so requiring it here would
+# mean nobody can compile a line of an MIT-licensed project until they have
+# accepted a third party's terms — and they are not publishing anything by
+# building. The result is a sysroot that produces a WASAPI-only standalone;
+# CMakeLists.txt notices the absence, says so, and demotes itself for exactly the
+# same reason. Waived loudly on stderr, in the same shape as this project's other
+# named opt-outs, so a log always shows which gate was skipped rather than
+# leaving a skipped step to look like a passed one.
 #---------------------------------------------------------------------------
-if ! done_stamp asiosdk; then
+if [ "${NAMPRACK_SKIP_ASIO:-0}" = "1" ]; then
+    say "ASIO SDK"
+    echo "warning: NAMPRACK_SKIP_ASIO=1 - the ASIO SDK was NOT installed." >&2
+    echo "warning: this sysroot builds a WASAPI-only standalone, which is not the" >&2
+    echo "warning: shipped product: ASIO is the primary Windows backend and the one" >&2
+    echo "warning: the latency depends on. Re-run without NAMPRACK_SKIP_ASIO to fetch it." >&2
+elif ! done_stamp asiosdk; then
     say "ASIO SDK"
 
     ASIO_SRC=""
@@ -405,6 +421,11 @@ ls -1 "$SYSROOT/lib"/*.a 2>/dev/null | sed 's|^|  |'
 echo
 if [ -f "$SYSROOT/include/asiosdk/common/asio.h" ]; then
     printf '  %-12s %s\n' "asiosdk" "include/asiosdk (host side only, not redistributed)"
+elif [ "${NAMPRACK_SKIP_ASIO:-0}" = "1" ]; then
+    # Absent because it was waived, which is a complete sysroot for a WASAPI-only
+    # build rather than a broken one. Still printed, and still says what it costs:
+    # the whole point of a named opt-out is that the log shows it was taken.
+    printf '  %-12s %s\n' "asiosdk" "skipped (NAMPRACK_SKIP_ASIO=1) - WASAPI-only standalone"
 else
     printf '  %-12s %s\n' "asiosdk" "MISSING"
     MISSING=1
